@@ -43,6 +43,7 @@ pub struct Config {
     pub stratum_port: u16,
     pub api_port: u16,
     pub web_port: u16,
+    pub web_readers: Vec<std::net::Ipv4Addr>,
     pub api_token: String,
     pub rpc_url: String,
     pub rpc_cookie: String,
@@ -75,6 +76,8 @@ impl Config {
             stratum_port: env("SOLO45_STRATUM_PORT", 3346),
             api_port: env("SOLO45_API_PORT", 3386),
             web_port: env("SOLO45_WEB_PORT", 0), // the status page; 0 = off (the Umbrel app sets 8346)
+            web_readers: std::env::var("SOLO45_WEB_READERS").unwrap_or_default().split(',')
+                .filter_map(|s| s.trim().parse().ok()).collect(), // e.g. the Solo45 dashboard's container
             api_token: env("SOLO45_API_TOKEN", String::new()),
             rpc_url: env("BITCOIN_RPC_URL", "http://127.0.0.1:8332/".to_string()),
             rpc_cookie: env("BITCOIN_RPC_COOKIE", "~/umbrel/app-data/bitcoin/data/bitcoin/.cookie".to_string()),

@@ -73,6 +73,13 @@ fn default_gateway() -> Option<Ipv4Addr> {
     })
 }
 
+/// Addresses allowed to READ the status and share feed on the status page's port (SOLO45_WEB_READERS, comma
+/// separated): the Solo45 dashboard's container, so it can show Core next to Solo45. Never settings or backups.
+fn is_reader(pool: &Pool, ip: IpAddr) -> bool {
+    let Some(ip) = v4(ip) else { return false };
+    pool.cfg.web_readers.iter().any(|r| *r == ip)
+}
+
 fn v4(ip: IpAddr) -> Option<Ipv4Addr> {
     match ip {
         IpAddr::V4(a) => Some(a),
@@ -150,6 +157,13 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
         }
         Kind::Web => {
             let trusted = is_local(peer.ip()) || (v4(peer.ip()).is_some() && v4(peer.ip()) == default_gateway());
+            let p = path.split('?').next().unwrap_or("");
+            if !trusted && method == "GET" && matches!(p, "/api/state" | "/api/shares") && is_reader(&pool, peer.ip()) {
+                // the Solo45 dashboard (SOLO45_WEB_READERS): read-only, status and share feed
+                let (s, v) = route(&pool, &method, &path, q.length, &mut r).await;
+                reply(&mut w, s, Body::Json(v)).await;
+                return;
+            }
             if !trusted {
                 log!("WARNING", "status page: refused a request from {} (open Solo45 Core from the Umbrel home screen)", peer.ip());
                 (403, Body::Json(json!({"error": "open Solo45 Core from your Umbrel's home screen"})))
@@ -158,8 +172,7 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
             } else if method == "POST" && !q.same_origin() {
                 (403, Body::Json(json!({"error": "changes are only accepted from the Solo45 Core page itself"})))
             } else {
-                let p = path.split('?').next().unwrap_or("");
-                if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export")
+                if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export" | "/api/shares")
                     | ("POST", "/api/worker" | "/api/settings" | "/api/payout" | "/api/policy" | "/api/restore")) {
                     let (s, v) = route(&pool, &method, &path, q.length, &mut r).await;
                     (s, Body::Json(v))

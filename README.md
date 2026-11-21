@@ -43,7 +43,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.4
+  ghcr.io/race45race/solo45-core:v0.0.5
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
@@ -56,6 +56,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_STRATUM_PORT` | 3346 | port for miners |
 | `SOLO45_API_PORT` | 3386 | Solo45-compatible API (local or `X-Solo45-Token`) |
 | `SOLO45_WEB_PORT` | 0 (off) | status page |
+| `SOLO45_WEB_READERS` | | addresses that may read the status and share feed on the status page's port (the Solo45 dashboard) |
 | `SOLO45_API_TOKEN` | | shared secret for the API |
 | `SOLO45_DATA_DIR` | . | state.json, blocks_found.jsonl |
 | `SOLO45_LOG_FILE` | stdout | log file, rotated at 20 MB |
