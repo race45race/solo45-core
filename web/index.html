@@ -61,8 +61,14 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 
   <h2>Miners</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Miner</th><th>Hashrate 1 h</th><th>5 min</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th>Best</th><th>Last share</th></tr></thead>
-    <tbody id="workers"><tr><td colspan="8" class="dim">No miners yet.</td></tr></tbody>
+    <thead><tr><th>Miner</th><th>Hashrate 1 h</th><th>5 min</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th>Best (since it connected)</th><th>Best ever</th><th>Last share</th></tr></thead>
+    <tbody id="workers"><tr><td colspan="9" class="dim">No miners yet.</td></tr></tbody>
+  </table></div>
+
+  <h2>Live shares</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Time</th><th>Miner</th><th>Share</th><th>Difficulty</th><th>Result</th></tr></thead>
+    <tbody id="shares"><tr><td colspan="5" class="dim">Waiting for shares…</td></tr></tbody>
   </table></div>
 
   <div id="blockwrap" hidden>
@@ -177,6 +183,7 @@ function card(k, v, s, cls = "") {
 function render(d) {
   const p = d.pool, now = d.now, ws = d.workers || [];
   $("ver").textContent = "v" + d.version;
+  noteUptime(d.uptime);
   const live = p.height && p.template_age != null && p.template_age < 300;
   $("status").textContent = live ? "Mining block " + p.height.toLocaleString() : "Waiting for the node";
   $("status").className = "pill " + (live ? "ok" : "bad");
@@ -204,8 +211,8 @@ function render(d) {
     return `<tr><td><b>${esc(w.name)}</b> <span class="dim">${esc(w.ip)}</span></td>` +
       `<td>${esc(hs(w.hashrate_1h))}</td><td>${esc(hs(w.hashrate_5m))}</td><td>${esc(si(w.diff))}</td>` +
       `<td>${esc((w.accepted || 0).toLocaleString())}</td><td class="${r ? "warn" : ""}">${esc(r)}</td>` +
-      `<td>${esc(si(w.best))}</td><td class="${stale ? "bad" : ""}">${esc(ago(w.last_share, now))}</td></tr>`;
-  }).join("") : `<tr><td colspan="8" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
+      `<td>${esc(si(w.best))}</td><td>${esc(si(w.best_ever || w.best))}</td><td class="${stale ? "bad" : ""}">${esc(ago(w.last_share, now))}</td></tr>`;
+  }).join("") : `<tr><td colspan="9" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
   const blocks = (p.blocks || []).slice().reverse();
   $("blockwrap").hidden = !blocks.length;
   $("blocks").innerHTML = blocks.map(b => `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(b.worker)}</td>` +
@@ -330,6 +337,25 @@ $("bkfile").addEventListener("change", async ev => {
   post("api/restore", data, "bkmsg", j => (j.ok ? "Restored: " : "Partly restored: ") + (j.restored || []).join(", ") +
        (j.errors && j.errors.length ? ". Problems: " + j.errors.join("; ") : "."));
 });
+// live shares: the pool keeps the latest 300 with a running number; ask only for the new ones
+let shareSeq = 0, shareRows = [], lastUptime = 0;
+function noteUptime(up) { // the pool restarted: its share numbers start again at 1
+  if (up < lastUptime) shareSeq = 0;
+  lastUptime = up;
+}
+async function refreshShares() {
+  try {
+    const r = await fetch("api/shares?since=" + shareSeq, {cache: "no-store"});
+    if (!r.ok) return;
+    const fresh = (await r.json()).shares || [];
+    for (const s of fresh) shareSeq = Math.max(shareSeq, s.seq);
+    if (!fresh.length) return;
+    shareRows = fresh.slice().reverse().concat(shareRows).slice(0, 20);
+    $("shares").innerHTML = shareRows.map(s => `<tr><td>${esc(new Date(s.t * 1000).toLocaleTimeString())}</td>` +
+      `<td>${esc(s.worker)}</td><td>${s.rejected ? "-" : esc(si(s.share))}</td><td>${s.rejected ? "-" : esc(si(s.diff))}</td>` +
+      `<td class="${s.block ? "good" : s.rejected ? "warn" : ""}">${s.block ? "BLOCK!" : s.rejected ? esc("rejected: " + s.rejected) : "accepted"}</td></tr>`).join("");
+  } catch (e) { /* the status line already shows a pool that doesn't answer */ }
+}
 async function refresh() {
   try {
     const r = await fetch("api/state", {cache: "no-store"});
@@ -361,6 +387,8 @@ $("payform").addEventListener("submit", async ev => {
 });
 refresh();
 setInterval(refresh, 5000);
+refreshShares();
+setInterval(refreshShares, 3000);
 </script>
 </body>
 </html>

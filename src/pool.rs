@@ -1009,6 +1009,10 @@ impl Pool {
         if share_diff > st["best_ever"]["diff"].as_f64().unwrap_or(0.0) {
             st["best_ever"] = json!({"diff": share_diff, "worker": name, "at": now});
         }
+        // each miner's best share ever on this pool (kept in state.json across restarts and updates)
+        if share_diff > st["miner_best"][name]["diff"].as_f64().unwrap_or(0.0) {
+            st["miner_best"][name] = json!({"diff": share_diff, "at": now});
+        }
     }
 
     pub fn share_rejected(&self, name: &str, reason: &str) {
@@ -1303,6 +1307,10 @@ impl Pool {
             v
         };
         let mut workers = workers;
+        let miner_best = self.state.lock().unwrap()["miner_best"].clone();
+        for w in workers.iter_mut() {
+            w["best_ever"] = miner_best[w["name"].as_str().unwrap_or("")]["diff"].clone();
+        }
         for w in workers.iter_mut() {
             w["override"] = self.override_for(w["name"].as_str().unwrap_or(""));
         }

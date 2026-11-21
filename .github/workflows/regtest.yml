@@ -1,0 +1,56 @@
+name: Regtest
+
+# Every push to main and every version tag: Solo45 Core finds real blocks on a private regtest chain run by the same
+# Bitcoin Core as the owner's node (32.1, checked against bitcoincore.org's SHA256SUMS): Stratum V1 blocks (also
+# while the node is down and starting), a block the node refuses, the stall guard, and Stratum V2 over extended
+# channels (through the reference Translator Proxy) and standard channels. A release is only pinned in the app store
+# when this run passes too.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Solo45 Core
+        run: cargo build --release --locked
+      - name: Bitcoin Core 32.1 (checked against SHA256SUMS)
+        run: |
+          mkdir -p ~/solo45-test && cd ~/solo45-test
+          curl -fsSLO https://bitcoincore.org/bin/bitcoin-core-32.1/bitcoin-32.1-x86_64-linux-gnu.tar.gz
+          curl -fsSLO https://bitcoincore.org/bin/bitcoin-core-32.1/SHA256SUMS
+          sha256sum --ignore-missing -c SHA256SUMS
+          tar xzf bitcoin-32.1-x86_64-linux-gnu.tar.gz
+      - name: Reference Translator Proxy (Stratum V2)
+        run: cargo install translator_sv2 --version 0.7.0 --root ~/solo45-test/sv2bin --locked
+      - name: Put the checkout where the tools expect it
+        run: ln -s "$GITHUB_WORKSPACE" ~/solo45-core
+      - name: Stratum V1 found blocks (node down and starting too)
+        run: |
+          bash tools/regtest.sh start
+          python3 tools/test_regtest_blocks.py "$(cat ~/solo45-test/core-regtest/address.txt)" ~/solo45-test/core-regtest "$(cat ~/solo45-test/core-regtest/token.txt)"
+      - name: The node refuses a found block
+        run: python3 tools/test_node_reject.py
+      - name: Stall guard
+        run: python3 tools/test_stallguard.py
+      - name: Stratum V2 extended channels through the Translator Proxy
+        run: |
+          bash tools/sv2_regtest.sh start
+          python3 tools/test_sv2.py
+      - name: Stratum V2 standard channels
+        run: bash tools/test_sv2_standard.sh
+      - name: Logs
+        if: always()
+        run: |
+          for f in ~/solo45-test/core-regtest/pool.log ~/solo45-test/core-reject/pool.log ~/solo45-test/core-stallguard/pool.log \
+                   ~/solo45-test/core-sv2/pool.log ~/solo45-test/core-sv2/tproxy.log; do
+            echo "== $f"; tail -n 40 "$f" 2>/dev/null || true
+          done
