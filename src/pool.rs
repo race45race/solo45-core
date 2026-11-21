@@ -165,6 +165,11 @@ pub struct Stats {
     pub check_times: VecDeque<u64>,
     last_proposal: f64,
     proposal_checked: HashSet<Vec<u8>>,
+    /// Stratum V2: the last new block's work reaching SV2 channels (job made -> sent), and recent times
+    pub sv2_switch: Value,
+    pub sv2_times: VecDeque<u64>,
+    /// one reading a minute for the last 24 h: [time, pool TH/s over 5 min, miners]
+    pub history: VecDeque<(u64, f64, usize)>,
 }
 
 fn push_capped(q: &mut VecDeque<u64>, v: u64) {
@@ -988,6 +993,52 @@ impl Pool {
         }
     }
 
+    /// A new block's work has reached a connection's SV2 channels `ms` after Core made the job.
+    pub fn note_sv2_switch(&self, height: u64, ms: u64, channels: usize) {
+        let mut s = self.stats.lock().unwrap();
+        let same = s.sv2_switch["height"].as_u64() == Some(height);
+        let ms = if same { ms.max(s.sv2_switch["ms"].as_u64().unwrap_or(0)) } else { ms };
+        if same {
+            s.sv2_times.pop_back();
+        }
+        push_capped(&mut s.sv2_times, ms);
+        let n = if same { s.sv2_switch["channels"].as_u64().unwrap_or(0) as usize + channels } else { channels };
+        s.sv2_switch = json!({"height": height, "ms": ms, "at": now_f(), "channels": n});
+    }
+
+    fn history_path(&self) -> String {
+        format!("{}/history.json", self.cfg.data_dir)
+    }
+
+    /// Readings from the last 24 h saved by an earlier run (so the chart survives restarts and updates).
+    fn load_history(&self) {
+        let Ok(text) = std::fs::read_to_string(self.history_path()) else { return };
+        let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(&text) else { return };
+        let cutoff = now_f() as u64 - 86400;
+        let mut s = self.stats.lock().unwrap();
+        for r in rows {
+            if let (Some(t), Some(ths), Some(n)) = (r[0].as_u64(), r[1].as_f64(), r[2].as_u64()) {
+                if t >= cutoff {
+                    s.history.push_back((t, ths, n as usize));
+                }
+            }
+        }
+    }
+
+    fn save_history(&self) {
+        let body = json!(self.stats.lock().unwrap().history.iter().map(|(t, h, n)| json!([t, (h * 1000.0).round() / 1000.0, n]))
+            .collect::<Vec<_>>()).to_string();
+        let tmp = format!("{}.tmp", self.history_path());
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.history_path())) {
+            log!("WARNING", "couldn't save the hashrate history: {}", e);
+        }
+    }
+
+    pub fn history(&self) -> Value {
+        let s = self.stats.lock().unwrap();
+        json!({"history": s.history.iter().map(|(t, h, n)| json!([t, h, n])).collect::<Vec<_>>()})
+    }
+
     pub fn share_accepted(&self, name: &str, credit: f64, share_diff: f64, now: f64, block: bool) {
         {
             let mut s = self.stats.lock().unwrap();
@@ -1138,6 +1189,18 @@ impl Pool {
             let now = now_f();
             if n % 4 == 0 {
                 trim_memory();
+                {
+                    let workers = self.worker_count();
+                    let mut s = self.stats.lock().unwrap();
+                    let th = hashrate(s.shares.iter(), 300f64.min((now - self.started).max(60.0)), now) / 1e12;
+                    s.history.push_back((now as u64, th, workers));
+                    while s.history.front().map_or(false, |x| x.0 + 86400 < now as u64) {
+                        s.history.pop_front();
+                    }
+                }
+                if n % 40 == 0 {
+                    self.save_history(); // every 10 minutes
+                }
                 self.remember_diffs(now);
                 if let Err(e) = self.save_state() {
                     log!("WARNING", "couldn't save the state: {}", e);
@@ -1208,6 +1271,7 @@ impl Pool {
         tokio::spawn(self.clone().watch_blocks());
         tokio::spawn(self.clone().longpoll_blocks());
         tokio::spawn(self.clone().refresh_templates());
+        self.load_history();
         tokio::spawn(self.clone().housekeeping());
         tokio::spawn(self.clone().stall_guard_loop());
         Ok(())
@@ -1277,6 +1341,7 @@ impl Pool {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         self.remember_diffs(now_f());
+        self.save_history();
         if let Err(e) = self.save_state() {
             log!("WARNING", "couldn't save the state: {}", e);
         }
@@ -1345,6 +1410,7 @@ impl Pool {
                 "best_ever": st["best_ever"],
                 "blocks": st["blocks"],
                 "last_switch": s.last_switch,
+                "sv2_switch": {"last": s.sv2_switch, "ms_median": median(s.sv2_times.iter()), "blocks": s.sv2_times.len()},
                 "proposal": s.proposal,
                 "timing": {"build_ms": median(s.build_times.iter()), "blocks": s.build_times.len(),
                            "check_ms": median(s.check_times.iter()), "checks": s.check_times.len(),

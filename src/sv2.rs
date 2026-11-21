@@ -15,7 +15,7 @@
 use crate::job::Job;
 use crate::log;
 use crate::pool::{Ctl, NewJob, Pool, WorkerHandle, WorkerInfo};
-use crate::util::{now_f, push, script_num, target_diff};
+use crate::util::{fmt_diff, now_f, push, script_num, target_diff};
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,7 +50,6 @@ const SV2_VERSION: u16 = 2;
 const SERVER_TAG: u8 = 0x45; // first extranonce byte on this pool ("45")
 const MAX_CHANNELS: u32 = 65_536; // 2 bytes of channel index
 const CLIENT_EXTRANONCE: u8 = 16; // the space each channel rolls itself (what the reference pool gives)
-const SHARES_PER_MINUTE: f32 = 6.0; // a share every 10 s, like Core's V1 default
 const SHARE_BATCH: usize = 1; // acknowledge every share (small fleets: no reason to batch)
 const CERT_VALIDITY_S: u64 = 365 * 24 * 3600;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -195,6 +194,7 @@ struct Chan {
     address: String,
     spk: Vec<u8>,
     tip: String, // the block this channel's jobs build on (prev hash, display hex)
+    fixed: bool, // a fixed difficulty set for this miner (API override): no vardiff
 }
 
 struct Conn {
@@ -205,6 +205,8 @@ struct Conn {
     agent: String,
     chans: HashMap<u32, Chan>,
     next_channel: u32,
+    /// difficulty changes from the API (per-miner overrides), tagged with the channel they are for
+    ctl_tx: mpsc::UnboundedSender<(u32, f64)>,
 }
 
 impl Drop for Conn {
@@ -230,8 +232,10 @@ async fn connection(pool: Arc<Pool>, sv2: Arc<Sv2>, stream: TcpStream, peer: Soc
             }
         }
     });
-    let mut c = Conn { pool: pool.clone(), sv2, w, ip: peer.ip().to_string(), agent: "sv2".into(), chans: HashMap::new(), next_channel: 1 };
-    let result = c.run(&mut frx).await;
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
+    let mut c = Conn { pool: pool.clone(), sv2, w, ip: peer.ip().to_string(), agent: "sv2".into(), chans: HashMap::new(),
+                       next_channel: 1, ctl_tx };
+    let result = c.run(&mut frx, &mut ctl_rx).await;
     reader.abort();
     if !c.chans.is_empty() {
         let names: Vec<&str> = c.chans.values().map(|ch| ch.name.as_str()).collect();
@@ -252,7 +256,8 @@ impl Conn {
         self.send(AnyMessageOwned::Mining(m)).await
     }
 
-    async fn run(&mut self, frx: &mut mpsc::Receiver<stratum_apps::utils::types::InboundFrame>) -> Result<()> {
+    async fn run(&mut self, frx: &mut mpsc::Receiver<stratum_apps::utils::types::InboundFrame>,
+                 ctl_rx: &mut mpsc::UnboundedReceiver<(u32, f64)>) -> Result<()> {
         // 1. SetupConnection, within 10 s
         let mut f = tokio::time::timeout(Duration::from_secs(10), frx.recv()).await
             .map_err(|_| anyhow!("no SetupConnection"))?.ok_or_else(|| anyhow!("closed before SetupConnection"))?;
@@ -295,10 +300,16 @@ impl Conn {
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     };
                     let ids: Vec<u32> = self.chans.keys().copied().collect();
-                    for id in ids {
-                        self.push_job(id, &job).await?;
+                    let new_block = self.chans.values().any(|c| c.tip != job.prev_hex);
+                    for id in &ids {
+                        self.push_job(*id, &job).await?;
+                    }
+                    if new_block && !ids.is_empty() {
+                        // the new block's work is out on every SV2 channel of this connection
+                        self.pool.note_sv2_switch(job.height, job.created.elapsed().as_millis() as u64, ids.len());
                     }
                 }
+                Some((id, diff)) = ctl_rx.recv() => self.set_difficulty(id, diff).await?,
                 _ = tick.tick() => self.vardiff().await?,
             }
         }
@@ -367,21 +378,38 @@ impl Conn {
         };
         let channel_id = self.next_channel;
         self.next_channel += 1;
+        // the miner as the API shows it: name after the first dot, like V1 usernames
+        let name = user.split_once('.').map(|(_, n)| n.to_string()).filter(|n| !n.is_empty())
+            .unwrap_or_else(|| if user.is_empty() { self.ip.clone() } else { user.clone() });
+        // per-miner settings, like V1: a share time (shares per minute) and a fixed difficulty
+        let ov = self.pool.override_for(&name);
+        let share_s = ov["share_seconds"].as_f64().unwrap_or(self.pool.cfg.share_seconds).clamp(1.0, 300.0);
+        let spm = (60.0 / share_s) as f32;
+        let fixed_diff = ov["diff"].as_f64();
         let tag = self.pool.cfg.coinbase_tag.clone();
         let made = if extended {
             ExtendedChannel::new_for_pool(channel_id, user.clone(), prefix, max_target, nominal, true, CLIENT_EXTRANONCE as u16,
-                                          SHARE_BATCH, SHARES_PER_MINUTE, tag, None).map(Ch::Ext).map_err(|e| format!("{:?}", e))
+                                          SHARE_BATCH, spm, tag, None).map(Ch::Ext).map_err(|e| format!("{:?}", e))
         } else {
-            StandardChannel::new_for_pool(channel_id, user.clone(), prefix, max_target, nominal, SHARE_BATCH, SHARES_PER_MINUTE,
+            StandardChannel::new_for_pool(channel_id, user.clone(), prefix, max_target, nominal, SHARE_BATCH, spm,
                                           tag, None).map(Ch::Std).map_err(|e| format!("{:?}", e))
         };
-        let ch = match made {
+        let mut ch = match made {
             Ok(ch) => ch,
             Err(e) => {
                 log!("INFO", "refused {} {} (Stratum V2): {}", self.ip, user, e);
                 return self.send_mining(refuse(if e.contains("Target") { "max-target-out-of-range" } else { "invalid-nominal-hashrate" })).await;
             }
         };
+        // start at the fixed difficulty, or where this miner left off (like V1's remembered difficulty), instead of the
+        // miner's own guess: a difficulty is a hashrate at this channel's share rate, which the channel turns into a target
+        let start = fixed_diff.or_else(|| self.pool.remembered_diff(&name));
+        if let Some(d) = start {
+            let h = (d * 4_294_967_296.0 * spm as f64 / 60.0) as f32;
+            if on!(&mut ch, x => x.update_channel(h, None).is_err()) {
+                log!("INFO", "{} (Stratum V2): couldn't start at difficulty {} (outside what the miner allows)", name, fmt_diff(d));
+            }
+        }
         let ok = match &ch {
             Ch::Ext(c) => MiningOwned::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccessOwned {
                 request_id, channel_id,
@@ -401,9 +429,6 @@ impl Conn {
         let diff = on!(&ch, x => x.get_target().difficulty_float());
         let kind = if extended { "extended" } else { "standard" };
         {
-                // the miner as the API shows it: name after the first dot, like V1 usernames
-                let name = user.split_once('.').map(|(_, n)| n.to_string()).filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| if user.is_empty() { self.ip.clone() } else { user.clone() });
                 let mut info = WorkerInfo::new(&self.ip, now_f());
                 info.name = name.clone();
                 info.user = user.clone();
@@ -413,11 +438,22 @@ impl Conn {
                 info.diff = diff;
                 let info = Arc::new(Mutex::new(info));
                 let worker_id = self.pool.next_worker_id();
-                let (ctl_tx, _ctl_rx) = mpsc::unbounded_channel::<Ctl>();
+                // difficulty changes from the API reach this connection tagged with the channel
+                let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<Ctl>();
+                let conn_tx = self.ctl_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(Ctl::SetDiff(d)) = ctl_rx.recv().await {
+                        if conn_tx.send((channel_id, d)).is_err() {
+                            break;
+                        }
+                    }
+                });
                 self.pool.workers.lock().unwrap().insert(worker_id, WorkerHandle { info: info.clone(), ctl: ctl_tx });
                 let vardiff = VardiffState::new().map_err(|e| anyhow!("vardiff: {:?}", e))?;
-                self.chans.insert(channel_id, Chan { ch, vardiff, worker_id, info, name: name.clone(), address: address.clone(), spk, tip: String::new() });
-                log!("INFO", "authorized {} {} ({}, Stratum V2 {} channel {}) pays {}", self.ip, name, self.agent, kind, channel_id, address);
+                self.chans.insert(channel_id, Chan { ch, vardiff, worker_id, info, name: name.clone(), address: address.clone(), spk,
+                                                     tip: String::new(), fixed: fixed_diff.is_some() });
+                log!("INFO", "authorized {} {} ({}, Stratum V2 {} channel {}) pays {}, difficulty {}{}", self.ip, name, self.agent, kind,
+                     channel_id, address, fmt_diff(diff), if fixed_diff.is_some() { " (fixed)" } else if start.is_some() { " (remembered)" } else { "" });
         }
         if let Some(job) = self.pool.current() {
             self.push_job(channel_id, &job).await?;
@@ -551,9 +587,29 @@ impl Conn {
     }
 
     /// Every minute: the reference vardiff per channel; a new target goes to the miner with SetTarget.
+    /// A difficulty from the API (a per-miner override set, or removed: then the miner's current difficulty comes back
+    /// and vardiff takes over again). Sent to the miner with SetTarget.
+    async fn set_difficulty(&mut self, channel_id: u32, diff: f64) -> Result<()> {
+        let Some(c) = self.chans.get_mut(&channel_id) else { return Ok(()) };
+        c.fixed = self.pool.override_for(&c.name)["diff"].as_f64().is_some();
+        let spm = on!(&c.ch, x => x.get_shares_per_minute()) as f64;
+        let h = (diff * 4_294_967_296.0 * spm / 60.0) as f32;
+        if on!(&mut c.ch, x => x.update_channel(h, None).is_err()) {
+            log!("WARNING", "{} (Stratum V2): difficulty {} is outside what the miner allows", c.name, fmt_diff(diff));
+            return Ok(());
+        }
+        let t = *on!(&c.ch, x => x.get_target());
+        c.info.lock().unwrap().diff = t.difficulty_float();
+        log!("INFO", "{} difficulty set to {} (Stratum V2{})", c.name, fmt_diff(t.difficulty_float()), if c.fixed { ", fixed" } else { "" });
+        self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id, target: t.to_le_bytes().into() })).await
+    }
+
     async fn vardiff(&mut self) -> Result<()> {
         let mut out = Vec::new();
         for (id, c) in self.chans.iter_mut() {
+            if c.fixed {
+                continue; // a fixed difficulty from the API
+            }
             let (h, t, spm) = on!(&c.ch, x => (x.get_nominal_hashrate(), *x.get_target(), x.get_shares_per_minute()));
             let Ok(Some(new_h)) = c.vardiff.try_vardiff(h, &t, spm) else {
                 on!(&mut c.ch, x => x.set_stable_hashrate(true));
@@ -579,7 +635,7 @@ impl Conn {
 /// Test miner for standard channels (header-only mining, like Braiins OS): connects over encrypted SV2, opens a
 /// standard channel, mines `shares` shares on the CPU and prints each result. On regtest every share is a block.
 ///   solo45-core sv2-miner <host:port> <authority pubkey> <user identity> <shares>
-pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32) -> Result<()> {
+pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause_s: f64) -> Result<()> {
     use stratum_apps::stratum_core::common_messages_sv2::SetupConnectionOwned;
     use stratum_apps::stratum_core::mining_sv2::OpenStandardMiningChannelOwned;
     use stratum_apps::stratum_core::noise_sv2::Initiator;
@@ -651,6 +707,9 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32) -> Re
         // mine one share on the current job, then wait for the answer (and new work, on regtest)
         if let (true, Some((job_id, version, root)), Some(p)) = (opened, job, prev) {
             if sent < shares && seq == sent {
+                if pause_s > 0.0 && sent > 0 {
+                    tokio::time::sleep(Duration::from_secs_f64(pause_s)).await; // load tests: one share every pause_s
+                }
                 let mut hdr = Vec::with_capacity(80);
                 hdr.extend(version.to_le_bytes());
                 hdr.extend(p);

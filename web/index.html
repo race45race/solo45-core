@@ -12,6 +12,13 @@ header{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:
 .mark{width:34px;height:34px;border-radius:50%;border:3px solid var(--accent);display:grid;place-items:center;font-weight:800;font-size:13px;color:var(--accent)}
 h1{font-size:19px;margin:0}
 h1 small{color:var(--dim);font-weight:400;font-size:13px;margin-left:6px}
+.dash{margin-left:auto;color:var(--accent);font-size:13px;text-decoration:none}
+.dash+.pill{margin-left:8px}
+.chart svg{width:100%;height:150px;display:block}
+.chart .grid{stroke:var(--line);stroke-width:1}
+.chart .line{fill:none;stroke:var(--accent);stroke-width:2;vector-effect:non-scaling-stroke}
+.chart .area{fill:var(--accent);opacity:.12}
+.chart text{fill:var(--dim);font-size:10px}
 .pill{margin-left:auto;padding:3px 10px;border-radius:99px;font-size:13px;background:var(--line);color:var(--dim)}
 .pill.ok{background:rgba(63,185,80,.15);color:var(--good)}
 .pill.bad{background:rgba(248,81,73,.15);color:var(--bad)}
@@ -50,6 +57,7 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 <header>
   <div class="mark">45</div>
   <h1>Solo45 Core <small id="ver"></small></h1>
+  <a id="dashlink" class="dash" href="#">Solo45 dashboard ↗</a>
   <span class="pill" id="status">connecting…</span>
 </header>
 <main>
@@ -58,6 +66,12 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
     <div class="s">Enter the Bitcoin address that found blocks pay to. Then point your miners at this Umbrel's IP address on port <b id="sport">3346</b>.</div>
   </div>
   <div class="grid" id="cards"></div>
+
+  <h2>Hashrate, last 24 hours</h2>
+  <div class="card chart">
+    <svg id="chart" viewBox="0 0 600 150" preserveAspectRatio="none" role="img" aria-label="Pool hashrate over the last 24 hours"></svg>
+    <div class="s" id="chartnote">Collecting: one reading a minute.</div>
+  </div>
 
   <h2>Miners</h2>
   <div class="tablewrap"><table>
@@ -153,6 +167,9 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
+// ?screenshot: hide the payout address and miners' IP addresses (for pictures)
+const SHOT = new URLSearchParams(location.search).has("screenshot");
+$("dashlink").href = `${location.protocol}//${location.hostname}:4545/`;
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function si(n, unit = "") {
   if (!isFinite(n) || n <= 0) return "0" + (unit ? " " + unit : "");
@@ -199,7 +216,8 @@ function render(d) {
     card("Miners", ws.length, ws.length ? ws.map(w => w.name).join(", ").slice(0, 60) : "none connected"),
     card("Shares", acc.toLocaleString(), rej ? rej + " rejected (" + (100 * rej / Math.max(1, acc + rej)).toFixed(2) + "%)" : "0 rejected", rej ? "" : "good"),
     card("Best share", si(best.diff), "since start" + (best.worker ? " · " + best.worker : "") + " · ever " + si(ever.diff)),
-    card("New block → miners", sw.ms != null ? sw.ms + " ms" : "-", sw.height ? "block " + sw.height.toLocaleString() + ", " + ago(sw.at, now) : "no block yet"),
+    card("New block → miners", sw.ms != null ? sw.ms + " ms" : "-", (sw.height ? "block " + sw.height.toLocaleString() + ", " + ago(sw.at, now) : "no block yet")
+         + (p.sv2_switch && p.sv2_switch.ms_median != null ? ` · Stratum V2 ${Math.round(p.sv2_switch.ms_median)} ms (median, ${p.sv2_switch.blocks} blocks)` : "")),
     card("Block template", (p.txs || 0).toLocaleString() + " txs", btc(p.reward || 0) + (p.empty_job ? " · empty (new block)" : "") + " · fees " + btc(p.fees || 0)),
     card("Node's block check", prop.ok === true ? "OK" : prop.ok === false ? "FAILED" : "-",
          (p.timing && p.timing.check_ms != null ? Math.round(p.timing.check_ms) + " ms" : "") + (p.zmq ? " · instant block signal on" : " · block signal by polling"),
@@ -208,7 +226,7 @@ function render(d) {
   ].join("");
   $("workers").innerHTML = ws.length ? ws.map(w => {
     const r = sum(w.rejected), stale = now - (w.last_share || 0) > 300;
-    return `<tr><td><b>${esc(w.name)}</b> <span class="dim">${esc(w.ip)}</span></td>` +
+    return `<tr><td><b>${esc(w.name)}</b> <span class="dim">${SHOT ? "" : esc(w.ip)}</span></td>` +
       `<td>${esc(hs(w.hashrate_1h))}</td><td>${esc(hs(w.hashrate_5m))}</td><td>${esc(si(w.diff))}</td>` +
       `<td>${esc((w.accepted || 0).toLocaleString())}</td><td class="${r ? "warn" : ""}">${esc(r)}</td>` +
       `<td>${esc(si(w.best))}</td><td>${esc(si(w.best_ever || w.best))}</td><td class="${stale ? "bad" : ""}">${esc(ago(w.last_share, now))}</td></tr>`;
@@ -228,7 +246,8 @@ function render(d) {
   renderPolicy(p.policy || {}, now);
   renderGuard(p.stall_guard || {}, now);
   if (!formsFilled) fillForms(p);
-  $("addr").textContent = p.default_address || "not set";
+  $("addr").textContent = SHOT ? "bc1q… (hidden for the screenshot)" : (p.default_address || "not set");
+  $("payform").hidden = SHOT;
   $("addrnote").textContent = p.force_default_address
     ? "Every miner pays here, whatever its username says."
     : "Miners whose username is a Bitcoin address pay that address; the rest pay here.";
@@ -337,6 +356,27 @@ $("bkfile").addEventListener("change", async ev => {
   post("api/restore", data, "bkmsg", j => (j.ok ? "Restored: " : "Partly restored: ") + (j.restored || []).join(", ") +
        (j.errors && j.errors.length ? ". Problems: " + j.errors.join("; ") : "."));
 });
+// the 24 h hashrate chart: one reading a minute from the pool (kept across restarts)
+async function refreshChart() {
+  try {
+    const r = await fetch("api/history", {cache: "no-store"});
+    if (!r.ok) return;
+    const h = (await r.json()).history || [];
+    const svg = $("chart");
+    if (h.length < 2) { svg.innerHTML = ""; return; }
+    const now = Date.now() / 1000, t0 = now - 86400;
+    const max = Math.max(...h.map(x => x[1]), 0.001) * 1.15;
+    const X = t => Math.max(0, (t - t0) / 86400 * 600), Y = v => 140 - v / max * 130;
+    const pts = h.filter(x => x[0] >= t0).map(x => `${X(x[0]).toFixed(1)},${Y(x[1]).toFixed(1)}`);
+    const grid = [0.25, 0.5, 0.75, 1].map(f => `<line class="grid" x1="0" x2="600" y1="${Y(max / 1.15 * f)}" y2="${Y(max / 1.15 * f)}"/>` +
+      `<text x="2" y="${Y(max / 1.15 * f) - 2}">${si(max / 1.15 * f * 1e12, "H/s")}</text>`).join("");
+    const first = pts[0].split(",")[0], last = pts[pts.length - 1].split(",")[0];
+    svg.innerHTML = grid + `<polygon class="area" points="${first},140 ${pts.join(" ")} ${last},140"/>` +
+      `<polyline class="line" points="${pts.join(" ")}"/>`;
+    const avg = h.reduce((a, x) => a + x[1], 0) / h.length;
+    $("chartnote").textContent = `Average ${si(avg * 1e12, "H/s")} over ${h.length >= 1400 ? "24 hours" : Math.round(h.length / 60 * 10) / 10 + " hours so far"}; the left edge is 24 hours ago.`;
+  } catch (e) { /* shown again on the next refresh */ }
+}
 // live shares: the pool keeps the latest 300 with a running number; ask only for the new ones
 let shareSeq = 0, shareRows = [], lastUptime = 0;
 function noteUptime(up) { // the pool restarted: its share numbers start again at 1
@@ -389,6 +429,8 @@ refresh();
 setInterval(refresh, 5000);
 refreshShares();
 setInterval(refreshShares, 3000);
+refreshChart();
+setInterval(refreshChart, 60000);
 </script>
 </body>
 </html>

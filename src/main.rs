@@ -35,7 +35,8 @@ async fn main() -> Result<()> {
         Some("node") => node().await,
         Some("job") if args.len() == 5 => job_dump(&args[2], &args[3], &args[4]),
         Some("policy") if args.len() == 4 => policy_dump(&args[2], &args[3]),
-        Some("sv2-miner") if args.len() == 6 => sv2::test_miner(&args[2], &args[3], &args[4], args[5].parse()?).await,
+        Some("sv2-miner") if args.len() == 6 || args.len() == 7 =>
+            sv2::test_miner(&args[2], &args[3], &args[4], args[5].parse()?, args.get(6).map_or(Ok(0.0), |a| a.parse())?).await,
         _ => bail!("usage: solo45-core serve | version | node | job <template.json> <tag> <spk_hex> | policy <template.json> <config.json>"),
     }
 }

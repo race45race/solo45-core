@@ -158,7 +158,7 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
         Kind::Web => {
             let trusted = is_local(peer.ip()) || (v4(peer.ip()).is_some() && v4(peer.ip()) == default_gateway());
             let p = path.split('?').next().unwrap_or("");
-            if !trusted && method == "GET" && matches!(p, "/api/state" | "/api/shares") && is_reader(&pool, peer.ip()) {
+            if !trusted && method == "GET" && matches!(p, "/api/state" | "/api/shares" | "/api/history") && is_reader(&pool, peer.ip()) {
                 // the Solo45 dashboard (SOLO45_WEB_READERS): read-only, status and share feed
                 let (s, v) = route(&pool, &method, &path, q.length, &mut r).await;
                 reply(&mut w, s, Body::Json(v)).await;
@@ -172,7 +172,7 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
             } else if method == "POST" && !q.same_origin() {
                 (403, Body::Json(json!({"error": "changes are only accepted from the Solo45 Core page itself"})))
             } else {
-                if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export" | "/api/shares")
+                if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export" | "/api/shares" | "/api/history")
                     | ("POST", "/api/worker" | "/api/settings" | "/api/payout" | "/api/policy" | "/api/restore")) {
                     let (s, v) = route(&pool, &method, &path, q.length, &mut r).await;
                     (s, Body::Json(v))
@@ -209,6 +209,7 @@ async fn route<R: AsyncRead + Unpin>(pool: &Arc<Pool>, method: &str, path: &str,
             }
         }
         ("GET", "/api/export") => (200, pool.export_settings()),
+        ("GET", "/api/history") => (200, pool.history()),
         ("GET", "/api/shares") => {
             let since = query.split('&').find_map(|kv| kv.strip_prefix("since=")).and_then(|v| v.parse().ok()).unwrap_or(0);
             (200, pool.shares_since(since))

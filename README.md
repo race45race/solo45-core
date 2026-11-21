@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.svg" alt="Solo45 Core" width="112"></p>
+
 # Solo45 Core
 
 **A fast solo Bitcoin mining pool in Rust, for your own node.** Test version.
@@ -30,7 +32,13 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   on a private regtest chain (blocks with segwit transactions accepted by the node, over both channel types) and on
   mainnet templates. `solo45-core sv2-miner <host:port> <authority key> <user> <shares>` is a small CPU test miner
   for standard channels.
-- **Small.** One binary, about 2% of a CPU core and 40-160 MB of memory with full mainnet templates.
+- **Status page:** hashrate over 24 hours, live shares, each miner's best share ever, block switch times (V1 and
+  SV2), the node's block check, settings and backup/restore. `?screenshot` hides the payout address and miner IPs.
+- **Small and fast.** One binary. Load test (tools/load_test.py) with 100 Stratum V1 and 20 Stratum V2 miners on
+  mainnet templates for 12 minutes: 7,469 shares, 0.7% of one CPU core, 33-76 MB of memory, a new block's work to
+  all 100 V1 miners in 1 ms and to all 20 SV2 channels in 2 ms.
+- **Tested on every release:** GitHub runs the private regtest chain tests (real blocks over V1 and both kinds of
+  SV2 channel, a block the node refuses, the stall guard) before a version reaches the app store.
 
 Planned: job declaration, a proxy mode and public stats pages.
 
@@ -50,7 +58,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.7
+  ghcr.io/race45race/solo45-core:v0.0.9
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
