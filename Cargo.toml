@@ -1,0 +1,18 @@
+[package]
+name = "solo45-core"
+version = "0.0.3"
+edition = "2021"
+description = "Solo45 Core: a fast solo Bitcoin mining pool (Stratum V1 first, Stratum V2 later)"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,23 @@
+name: Tests
+
+# On every push to main and every pull request: build the image (not published), which runs the unit tests,
+# on x86 and on a real ARM machine. Releases are built and published by image.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t solo45-core-test .
+      - run: docker run --rm solo45-core-test version
