@@ -58,7 +58,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.9
+  ghcr.io/race45race/solo45-core:v0.0.10
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
@@ -72,7 +72,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_API_PORT` | 3386 | Solo45-compatible API (local or `X-Solo45-Token`) |
 | `SOLO45_WEB_PORT` | 0 (off) | status page |
 | `SOLO45_SV2_PORT` | 0 (off) | Stratum V2 port (the authority key is made on first start, in sv2-authority.json) |
-| `SOLO45_WEB_READERS` | | addresses that may read the status and share feed on the status page's port (the Solo45 dashboard) |
+| `SOLO45_WEB_READERS` | | addresses that may read the status, share feed and history on the status page's port and set per-miner difficulty (the Solo45 dashboard) |
 | `SOLO45_API_TOKEN` | | shared secret for the API |
 | `SOLO45_DATA_DIR` | . | state.json, blocks_found.jsonl |
 | `SOLO45_LOG_FILE` | stdout | log file, rotated at 20 MB |
@@ -84,6 +84,38 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_EMPTY_HOLD_S` | 10 | how long the empty job for a new block runs before the full template |
 | `SOLO45_TEMPLATE_REFRESH_S` | 30 | new job with fresh transactions |
 | `SOLO45_STALL_GUARD_S` | 60 | stall guard (0 = off; the status page setting wins) |
+
+## API
+
+Two HTTP listeners, both JSON.
+
+**The API** (`SOLO45_API_PORT`, default 3386; not published by the Umbrel app) answers only the machine itself, or
+a caller that sends the shared secret as `X-Solo45-Token` (`SOLO45_API_TOKEN`). It's compatible with Solo45's pool
+API, so tools written for Solo45 work with Core.
+
+**The status page** (`SOLO45_WEB_PORT`) serves the page and the same routes, but only to the machine itself and the
+container's default gateway (umbrelOS's login-checking app gateway). Changes there also need a same-origin browser
+request (`Sec-Fetch-Site: same-origin`, or an `Origin` matching `Host`). Addresses in `SOLO45_WEB_READERS` (the Solo45
+dashboard) may only read `/api/state`, `/api/shares` and `/api/history`, and POST `/api/worker`.
+
+| Route | | |
+|---|---|---|
+| `GET /api/state` | snapshot | `pool` (height, hashrate_1h / _5m in H/s, network_diff, accepted, rejected, best, last_switch, sv2_switch, timing, policy, …), `workers` (name, ip, agent, address, diff, hashrate, accepted, rejected, last_share, best_ever, override), `sv2` (port, authority key), `version`, `uptime` |
+| `GET /api/shares?since=N` | live share feed | shares with a sequence number above N (worker, diff, share difficulty, time) |
+| `GET /api/history` | 24 h chart | `{"history": [[time, hashrate H/s, miners], …]}` |
+| `GET /api/export` | backup | settings, per-miner overrides, policy, last difficulties |
+| `POST /api/worker` | per-miner difficulty | `{"name": "Bitaxe7", "diff": 2000}`, `{"name": …, "share_seconds": 10}`, or `{"name": …}` for automatic |
+| `POST /api/settings` | pool settings | any of `template_refresh_s` (1-120), `stall_guard_s` (0 or 20-600), `empty_first`, `empty_hold_s` (1-40), `force_default_address` |
+| `POST /api/payout` | payout address | `{"address": "bc1…"}`; your node checks it first |
+| `POST /api/policy` | template policy | `{"mode": "off"\|"watch"\|"filter", "rules": {…}}` (see the page's Save policy) |
+| `POST /api/restore` | load a backup | the `/api/export` JSON (or a Solo45 dashboard backup) |
+
+Example from the machine Core runs on:
+
+```sh
+curl -s localhost:3386/api/state | jq '.pool.hashrate_1h, [.workers[].name]'
+curl -s -X POST localhost:3386/api/worker -H 'Content-Type: application/json' -d '{"name":"Bitaxe7","share_seconds":10}'
+```
 
 ## Build
 

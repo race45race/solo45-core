@@ -194,6 +194,22 @@ function dur(s) {
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
   return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
 }
+// chance of finding at least one block in `secs` at hashrate h (H/s) and network difficulty nd (a block takes nd * 2^32
+// hashes on average)
+function chance(h, nd, secs) {
+  return h > 0 && nd > 0 ? -Math.expm1(-h * secs / (nd * 4294967296)) : 0;
+}
+function pct(x) {
+  return x >= 0.995 ? "over 99%" : x >= 0.1 ? (100 * x).toFixed(0) + "%" : x >= 0.001 ? (100 * x).toFixed(2) + "%" : x > 0 ? "1 in " + Math.round(1 / x).toLocaleString() : "-";
+}
+function odds(h, nd, secs) {
+  return chance(h, nd, secs) > 0 ? pct(chance(h, nd, secs)) + " a day" : "-";
+}
+function oddsNote(h, nd) {
+  if (!(h > 0 && nd > 0)) return "from the last hour's hashrate";
+  const years = nd * 4294967296 / h / 31557600;
+  return pct(chance(h, nd, 31557600)) + " a year · one block every " + (years >= 1 ? Math.round(years).toLocaleString() + " years" : Math.round(years * 365) + " days") + " on average (1 h hashrate)";
+}
 function card(k, v, s, cls = "") {
   return `<div class="card"><div class="k">${esc(k)}</div><div class="v ${cls}">${esc(v)}</div><div class="s">${esc(s)}</div></div>`;
 }
@@ -222,6 +238,7 @@ function render(d) {
     card("Node's block check", prop.ok === true ? "OK" : prop.ok === false ? "FAILED" : "-",
          (p.timing && p.timing.check_ms != null ? Math.round(p.timing.check_ms) + " ms" : "") + (p.zmq ? " · instant block signal on" : " · block signal by polling"),
          prop.ok === true ? "good" : prop.ok === false ? "bad" : ""),
+    card("Block odds", odds(p.hashrate_1h, p.network_diff, 86400), oddsNote(p.hashrate_1h, p.network_diff)),
     card("Running for", dur(d.uptime), "network difficulty " + si(p.network_diff)),
   ].join("");
   $("workers").innerHTML = ws.length ? ws.map(w => {

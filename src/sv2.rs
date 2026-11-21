@@ -582,6 +582,12 @@ impl Conn {
             if let Some(j) = self.pool.current() {
                 i.last_height = Some(j.height);
             }
+            if i.accepted == 1 {
+                // how long a miner takes to send its first share after connecting (a Bitaxe returning after a Core
+                // update once took ~90 s at its remembered difficulty: this shows whether that repeats)
+                log!("INFO", "{} {}: first share {:.1} s after connecting (difficulty {})", self.ip, c.name, now - i.connected,
+                     fmt_diff(i.diff));
+            }
         }
         self.pool.share_accepted(&c.name, credit, share_diff, now, block);
     }

@@ -73,8 +73,9 @@ fn default_gateway() -> Option<Ipv4Addr> {
     })
 }
 
-/// Addresses allowed to READ the status and share feed on the status page's port (SOLO45_WEB_READERS, comma
-/// separated): the Solo45 dashboard's container, so it can show Core next to Solo45. Never settings or backups.
+/// Addresses allowed to read the status, share feed and history on the status page's port, and to pass on per-miner
+/// difficulty (SOLO45_WEB_READERS, comma separated): the Solo45 dashboard's container, which only accepts those
+/// changes through the Umbrel login. Never pool settings, the payout address, the policy, backups or restores.
 fn is_reader(pool: &Pool, ip: IpAddr) -> bool {
     let Some(ip) = v4(ip) else { return false };
     pool.cfg.web_readers.iter().any(|r| *r == ip)
@@ -158,8 +159,15 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
         Kind::Web => {
             let trusted = is_local(peer.ip()) || (v4(peer.ip()).is_some() && v4(peer.ip()) == default_gateway());
             let p = path.split('?').next().unwrap_or("");
-            if !trusted && method == "GET" && matches!(p, "/api/state" | "/api/shares" | "/api/history") && is_reader(&pool, peer.ip()) {
-                // the Solo45 dashboard (SOLO45_WEB_READERS): read-only, status and share feed
+            let reader_ok = match method.as_str() {
+                "GET" => matches!(p, "/api/state" | "/api/shares" | "/api/history"),
+                // the dashboard passes on per-miner difficulty it took through the Umbrel login (pool settings, the
+                // payout address, the policy and restores stay on Core's own page)
+                "POST" => p == "/api/worker",
+                _ => false,
+            };
+            if !trusted && reader_ok && is_reader(&pool, peer.ip()) {
+                // the Solo45 dashboard (SOLO45_WEB_READERS): status, share feed, history; per-miner difficulty
                 let (s, v) = route(&pool, &method, &path, q.length, &mut r).await;
                 reply(&mut w, s, Body::Json(v)).await;
                 return;
