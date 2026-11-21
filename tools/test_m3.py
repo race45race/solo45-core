@@ -108,7 +108,63 @@ def main():
     check("the export has the settings", ex["settings"].get("empty_hold_s") == 8 and ex["settings"].get("default_address") == OWNER, ex["settings"])
     check("an unknown path is 404", req("GET", "/api/nope")[0] == 404)
     check("an unknown method is 405", req("DELETE", "/api")[0] == 405)
-    check("restore is not offered yet (501)", req("POST", "/api/restore", {})[0] == 501)
+
+    # stall guard settings (the guard itself: tools/test_stallguard.py)
+    check("the stall guard is on by default (60 s)", snap()["pool"]["stall_guard"]["seconds"] == 60, snap()["pool"]["stall_guard"])
+    st, _ = req("POST", "/api/settings", {"stall_guard_s": 15})
+    check("a stall guard under 20 s is refused", st == 400)
+    st, rep = req("POST", "/api/settings", {"stall_guard_s": 0})
+    check("the stall guard can be turned off", st == 200 and rep["stall_guard_s"] == 0 and snap()["pool"]["stall_guard"]["seconds"] == 0)
+    req("POST", "/api/settings", {"stall_guard_s": 60})
+
+    # template policy: watch counts, filter leaves transactions out and the node still accepts the block
+    pol = snap()["pool"]["policy"]
+    check("the policy starts in watch mode with pool.py's rules", pol["mode"] == "watch" and set(pol["rules"]) ==
+          {"inscriptions", "opreturn", "baremultisig", "runes", "minfee"}, pol["mode"])
+    st, _ = req("POST", "/api/policy", {"mode": "loud"})
+    check("an unknown policy mode is refused", st == 400)
+    st, _ = req("POST", "/api/policy", {"rules": {"minfee": {"sat_vb": 5000}}})
+    check("a fee rule over 1,000 sat/vB is refused", st == 400)
+    node_txs = snap()["pool"]["txs"]
+    t_change = time.time()
+    st, rep = req("POST", "/api/policy", {"mode": "filter"})
+    check("filter mode is accepted", st == 200 and rep["mode"] == "filter", st)
+    cur = None
+    for _ in range(40):
+        time.sleep(1)
+        s = snap()
+        cur = s["pool"]["policy"]["current"]
+        if cur and cur.get("filtered") and cur["at"] > t_change:
+            break
+    check("the next job leaves the counted transactions out", cur and cur.get("filtered") and cur["skipped"] > 0
+          and s["pool"]["txs"] < max(node_txs, cur["txs"]), cur and (cur["skipped"], cur["txs"], s["pool"]["txs"]))
+    ok = None
+    for _ in range(120):
+        pr = snap()["pool"]["proposal"]
+        if pr.get("at", 0) > cur["at"] if cur else 0:
+            ok = pr.get("ok")
+            break
+        time.sleep(1)
+    check("the node's block check accepts the filtered job", ok is True, snap()["pool"]["proposal"])
+    st, rep = req("POST", "/api/policy", {"mode": "watch"})
+    check("back to watch mode", st == 200 and rep["mode"] == "watch")
+
+    # backup and restore
+    ex = req("GET", "/api/export")[1]
+    check("the export has the policy", ex["policy"]["mode"] == "watch" and "rules" in ex["policy"])
+    ex["overrides"]["restored-miner"] = {"share_seconds": 7}
+    ex["last_diff"]["restored-miner"] = [1234.5, time.time()]
+    ex["policy"]["rules"]["opreturn"]["max_bytes"] = 80
+    st, rep = req("POST", "/api/restore", ex)
+    check("a backup restores every part", st == 200 and rep["ok"] and not rep["errors"], rep)
+    e2 = req("GET", "/api/export")[1]
+    check("restored values are in effect", e2["overrides"].get("restored-miner") == {"share_seconds": 7}
+          and e2["last_diff"]["restored-miner"][0] == 1234.5 and e2["policy"]["rules"]["opreturn"]["max_bytes"] == 80)
+    st, rep = req("POST", "/api/restore", {"settings": {"default_address": "notanaddress", "empty_hold_s": 9}})
+    check("a bad part is reported and the rest restored", st == 200 and not rep["ok"] and len(rep["errors"]) == 1
+          and any("job timing" in d for d in rep["restored"]), rep)
+    ex["policy"]["rules"]["opreturn"]["max_bytes"] = 83
+    req("POST", "/api/restore", {"policy": ex["policy"]})
 
     base = f"http://{LAN_IP}:{API_PORT}"
     check("another machine without the token gets 403", req("GET", "/api", base=base)[0] == 403)

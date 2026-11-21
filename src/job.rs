@@ -40,6 +40,8 @@ pub struct Job {
     pub hold_done: tokio::sync::Notify,
     /// the template was fetched again near the end of this empty job's hold
     pub refreshed: std::sync::atomic::AtomicBool,
+    /// built from a template the policy filtered (if the node's check rejects it, mine the node's own template)
+    pub filtered: bool,
     coinb2_cache: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
     /// shares already seen for this job (only ones that passed the difficulty check, or block candidates)
     pub seen: Mutex<HashSet<ShareKey>>,
@@ -81,7 +83,7 @@ impl Job {
             let key = t.get("hash").and_then(|h| h.as_str()).unwrap_or(txid);
             let data = match cache.get(key) {
                 Some(d) => d.clone(),
-                None => Arc::new(hex::decode(t["data"].as_str().ok_or_else(|| anyhow!("tx data"))?)?),
+                None => Arc::new(t["data"].as_str().and_then(crate::util::unhex).ok_or_else(|| anyhow!("tx data"))?),
             };
             next.insert(key.to_string(), data.clone());
             tx_data.push(data);
@@ -122,6 +124,7 @@ impl Job {
             empty: false,
             hold_done: tokio::sync::Notify::new(),
             refreshed: std::sync::atomic::AtomicBool::new(false),
+            filtered: false,
             coinb2_cache: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashSet::new()),
         })

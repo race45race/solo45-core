@@ -9,7 +9,9 @@
 mod api;
 mod job;
 mod pool;
+mod policy;
 mod rpc;
+mod stallguard;
 mod stratum;
 mod util;
 mod zmq;
@@ -29,7 +31,8 @@ async fn main() -> Result<()> {
         }
         Some("node") => node().await,
         Some("job") if args.len() == 5 => job_dump(&args[2], &args[3], &args[4]),
-        _ => bail!("usage: solo45-core serve | version | node | job <template.json> <tag> <spk_hex>"),
+        Some("policy") if args.len() == 4 => policy_dump(&args[2], &args[3]),
+        _ => bail!("usage: solo45-core serve | version | node | job <template.json> <tag> <spk_hex> | policy <template.json> <config.json>"),
     }
 }
 
@@ -112,6 +115,41 @@ async fn node() -> Result<()> {
         info["chain"], info["blocks"], j.height, j.tx_data.len(), j.fees, j.branch.len(), j.coinb1.len(), cb2.len()
     );
     println!("timing: chain info {:?}, template {:?}, job built {:?}", t1, t2 - t1, t3 - t2);
+    Ok(())
+}
+
+/// What the template policy does to a saved template under a saved config (for the pool.py cross-check).
+fn policy_dump(tpl_path: &str, cfg_path: &str) -> Result<()> {
+    let tpl: Value = serde_json::from_str(&std::fs::read_to_string(tpl_path)?)?;
+    let cfg = policy::load_config(&serde_json::from_str(&std::fs::read_to_string(cfg_path)?)?);
+    let mut ms = f64::MAX;
+    let mut r = policy::evaluate(&tpl, &cfg, true);
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        r = policy::evaluate(&tpl, &cfg, true);
+        ms = ms.min(t0.elapsed().as_secs_f64() * 1000.0); // best of 5 (the first run pays for page faults)
+    }
+    if std::env::var("S45_PROFILE").is_ok() {
+        let txs = tpl["transactions"].as_array().unwrap();
+        let t0 = std::time::Instant::now();
+        let raws: Vec<Vec<u8>> = txs.iter().map(|t| util::unhex(t["data"].as_str().unwrap()).unwrap()).collect();
+        let t1 = t0.elapsed();
+        let n: usize = raws.iter().filter(|r| r.windows(2).any(|w| w == [0, 0x63])).count();
+        let t2 = t0.elapsed();
+        let parsed = raws.iter().filter(|r| policy::parse_tx(r, false).is_some()).count();
+        let t3 = t0.elapsed();
+        eprintln!("hex decode {:?}, envelope scan {:?} ({} hits), parse {:?} ({} ok)", t1, t2 - t1, n, t3 - t2, parsed);
+    }
+    let applied = policy::apply(&tpl, &r);
+    let out = json!({
+        "skip": r.skip.iter().map(|(n, w)| json!([n, w])).collect::<Vec<_>>(),
+        "fees_skipped": r.fees_skipped, "weight_skipped": r.weight_skipped, "by_rule": r.by_rule,
+        "watched": r.watched, "fees_watched": r.fees_watched, "watch_by_rule": r.watch_by_rule,
+        "coinbasevalue": applied["coinbasevalue"], "default_witness_commitment": applied["default_witness_commitment"],
+        "depends": applied["transactions"].as_array().map(|a| a.iter().map(|t| t["depends"].clone()).collect::<Vec<_>>()),
+        "ms": ms,
+    });
+    println!("{}", out);
     Ok(())
 }
 

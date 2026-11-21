@@ -1,7 +1,7 @@
 //! The pool's HTTP side, in two listeners.
 //!
 //! The API (SOLO45_API_PORT), compatible with pool.py's: GET the snapshot, /api/shares?since=N, /api/export; POST
-//! /api/worker, /api/settings, /api/payout. Only the machine itself, or a caller with the app's shared secret
+//! /api/worker, /api/settings, /api/payout, /api/policy, /api/restore. Only the machine itself, or a caller with the app's shared secret
 //! (X-Solo45-Token), may use it, for reading too: it shows payout addresses and miner names and addresses.
 //!
 //! The status page (SOLO45_WEB_PORT, the Umbrel app's web port): the page itself, the snapshot and the same three
@@ -159,7 +159,8 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
                 (403, Body::Json(json!({"error": "changes are only accepted from the Solo45 Core page itself"})))
             } else {
                 let p = path.split('?').next().unwrap_or("");
-                if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export") | ("POST", "/api/worker" | "/api/settings" | "/api/payout")) {
+                if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export")
+                    | ("POST", "/api/worker" | "/api/settings" | "/api/payout" | "/api/policy" | "/api/restore")) {
                     let (s, v) = route(&pool, &method, &path, q.length, &mut r).await;
                     (s, Body::Json(v))
                 } else if method == "GET" {
@@ -176,8 +177,8 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
 async fn route<R: AsyncRead + Unpin>(pool: &Arc<Pool>, method: &str, path: &str, length: usize, r: &mut R) -> (u16, Value) {
     let (p, query) = path.split_once('?').unwrap_or((path, ""));
     match (method, p) {
-        ("POST", "/api/worker" | "/api/settings" | "/api/payout") => {
-            let mut body = vec![0u8; length.min(4096)];
+        ("POST", "/api/worker" | "/api/settings" | "/api/payout" | "/api/policy" | "/api/restore") => {
+            let mut body = vec![0u8; length.min(if p == "/api/restore" { 200_000 } else { 4096 })];
             match tokio::time::timeout(Duration::from_secs(5), r.read_exact(&mut body)).await {
                 Ok(Ok(_)) => {}
                 _ => return (400, json!({"error": "bad request"})),
@@ -189,10 +190,11 @@ async fn route<R: AsyncRead + Unpin>(pool: &Arc<Pool>, method: &str, path: &str,
             match p {
                 "/api/worker" => pool.set_override(&data),
                 "/api/settings" => pool.set_settings(&data).await,
+                "/api/policy" => pool.set_policy(&data).await,
+                "/api/restore" => pool.restore_settings(&data).await,
                 _ => pool.set_payout(&data).await,
             }
         }
-        ("POST", "/api/restore" | "/api/policy") => (501, json!({"error": "not in Solo45 Core yet"})),
         ("GET", "/api/export") => (200, pool.export_settings()),
         ("GET", "/api/shares") => {
             let since = query.split('&').find_map(|kv| kv.strip_prefix("since=")).and_then(|v| v.parse().ok()).unwrap_or(0);

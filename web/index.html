@@ -36,7 +36,13 @@ form{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 input{flex:1;min-width:220px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit}
 button{background:var(--accent);color:#111;border:0;border-radius:8px;padding:8px 14px;font:inherit;font-weight:600;cursor:pointer}
 .mono{font-family:ui-monospace,Consolas,monospace;font-size:13px;word-break:break-all}
-#msg{margin-top:6px;font-size:13px}
+#msg,#polmsg,#sgmsg,#bkmsg{margin-top:6px;font-size:13px}
+.rules{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px 16px;margin-top:10px}
+.rules label{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:14px}
+select,.rules input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit;min-width:0}
+.rules input{flex:0 0 90px;width:90px}
+.unit{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:13px}
+.filebtn{background:var(--line);color:var(--text);border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:600}
 footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 </style>
 </head>
@@ -77,6 +83,48 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
       <button type="submit">Save address</button>
     </form>
     <div id="msg"></div>
+  </div>
+
+  <h2>Template policy</h2>
+  <div class="card">
+    <div class="s">Leave chosen kinds of transactions out of the blocks Core builds. <b>Watch</b> only counts what a rule would
+      skip (and the fees it would cost); <b>Filter</b> leaves them out. Your node still checks every job, and if a filtered
+      job ever fails that check, Core mines the node's own template for that block.</div>
+    <div id="polnow" class="s" style="margin-top:8px"></div>
+    <div class="rules">
+      <label>Mode <select id="pmode"><option value="off">Off</option><option value="watch">Watch only</option><option value="filter">Filter</option></select></label>
+      <label>Inscriptions / Ordinals <select data-rule="inscriptions"></select></label>
+      <label>Runes <select data-rule="runes"></select></label>
+      <label>Large OP_RETURN data <select data-rule="opreturn"></select></label>
+      <label>… over <span class="unit"><input id="opmax" type="number" min="0" max="100000" step="1"> bytes</span></label>
+      <label>Bare multisig (Stamps) <select data-rule="baremultisig"></select></label>
+      <label>Fee rate below <select data-rule="minfee"></select></label>
+      <label>… of <span class="unit"><input id="minfee" type="number" min="0" max="1000" step="0.1"> sat/vB</span></label>
+    </div>
+    <form id="polform"><button type="submit">Save policy</button></form>
+    <div id="polmsg"></div>
+  </div>
+
+  <h2>Stall guard</h2>
+  <div class="card">
+    <div class="s">If a peer announces a new block but never sends it, your node can sit on the old block for up to 10 minutes.
+      The stall guard disconnects that peer after this many seconds, so the node gets the block from another one.</div>
+    <form id="sgform">
+      <input id="sgsec" type="number" min="0" max="600" step="1" style="max-width:120px;min-width:0"> <span class="s" style="align-self:center">seconds (20–600, 0 = off)</span>
+      <button type="submit">Save</button>
+    </form>
+    <div id="sgmsg"></div>
+    <div id="sgev" class="s" style="margin-top:6px"></div>
+  </div>
+
+  <h2>Backup</h2>
+  <div class="card">
+    <div class="s">Your payout address, settings, per-miner difficulty and template policy, in one file (no statistics or logs).</div>
+    <form id="bkform">
+      <button type="button" id="bkdown">Download backup</button>
+      <label class="filebtn">Restore from a file… <input type="file" id="bkfile" accept=".json,application/json" hidden></label>
+    </form>
+    <div id="bkmsg"></div>
   </div>
 </main>
 <footer>Solo45 Core · a solo mining pool on your own node · updates every 5 seconds</footer>
@@ -147,11 +195,118 @@ function render(d) {
   $("blocks").innerHTML = blocks.map(b => `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(b.worker)}</td>` +
     `<td>${esc(btc(b.value || 0))}</td><td class="${b.result == null ? "good" : "bad"}">${esc(b.result == null ? "accepted" : b.result)}</td>` +
     `<td>${esc(ago(b.at, now))}</td></tr>`).join("");
+  renderPolicy(p.policy || {}, now);
+  renderGuard(p.stall_guard || {}, now);
+  if (!formsFilled) fillForms(p);
   $("addr").textContent = p.default_address || "not set";
   $("addrnote").textContent = p.force_default_address
     ? "Every miner pays here, whatever its username says."
     : "Miners whose username is a Bitcoin address pay that address; the rest pay here.";
 }
+let formsFilled = false;
+const STATES = [["off", "Off"], ["watch", "Watch"], ["filter", "Filter"]];
+document.querySelectorAll("select[data-rule]").forEach(s => {
+  s.innerHTML = STATES.map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+});
+const ruleState = r => !r || !r.on ? "off" : r.watch ? "watch" : "filter";
+const sats = n => (n || 0).toLocaleString() + " sats";
+const byRule = (o, names) => Object.entries(o || {}).map(([k, v]) => `${(names || {})[k] || k} ${v.txs}`).join(", ");
+function renderPolicy(pol, now) {
+  const c = pol.current;
+  let t = "Mode: " + ({off: "off", watch: "watch only", filter: "filter"}[pol.mode] || "?") + ". ";
+  if (pol.mode === "off") t += "Every transaction your node offers goes into the block.";
+  else if (!c) t += "Waiting for the next job.";
+  else {
+    if (c.skipped) t += `${c.filtered ? "Leaving out" : "Would leave out"} ${c.skipped} of ${c.txs} transactions (${sats(c.fees_skipped)} in fees: ${byRule(c.by_rule, pol.names)}). `;
+    if (c.watched) t += `${c.skipped ? "Watch rules would also skip" : "Would leave out"} ${c.watched} of ${c.txs} transactions (${sats(c.fees_watched)} in fees: ${byRule(c.watch_by_rule, pol.names)}). `;
+    if (!c.skipped && !c.watched) t += `Nothing in this block's ${c.txs} transactions matches the rules.`;
+  }
+  const d = (pol.periods || [])[0];
+  if (d && d.blocks) t += ` Last 24 h: ${d.blocks} blocks, ${d.skipped ? "left out " + sats(d.fees_skipped) + " in fees" : ""}${d.skipped && d.watched ? ", " : ""}${d.watched ? "watch rules " + sats(d.fees_watched) : ""}${!d.skipped && !d.watched ? "nothing matched" : ""}.`;
+  if (pol.fallback_height) t += ` A filtered job failed the node's check at block ${pol.fallback_height.toLocaleString()}; that block used the node's own template.`;
+  $("polnow").textContent = t;
+}
+function renderGuard(g, now) {
+  const ev = (g.events || []).slice().reverse();
+  $("sgev").textContent = ev.length
+    ? "Recent: " + ev.slice(0, 3).map(e => `block ${e.height.toLocaleString()} waited ${e.waited_s} s, dropped ${e.peers.join(", ")} (${ago(e.at, now)})`).join("; ")
+    : (g.seconds ? "No peer has held up a block since this was turned on." : "Off.");
+}
+function fillForms(p) {
+  const pol = p.policy || {}, r = pol.rules || {};
+  $("pmode").value = pol.mode || "watch";
+  document.querySelectorAll("select[data-rule]").forEach(s => { s.value = ruleState(r[s.dataset.rule]); });
+  $("opmax").value = (r.opreturn || {}).max_bytes ?? 83;
+  $("minfee").value = (r.minfee || {}).sat_vb ?? 1;
+  $("sgsec").value = (p.stall_guard || {}).seconds ?? 60;
+  formsFilled = true;
+}
+async function post(path, body, msgId, okText) {
+  $(msgId).textContent = "Saving…";
+  $(msgId).className = "dim";
+  try {
+    const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    $(msgId).textContent = okText(j);
+    $(msgId).className = j.ok === false ? "warn" : "good";
+    formsFilled = false;
+    refresh();
+    return j;
+  } catch (e) {
+    $(msgId).textContent = "Not saved: " + e.message;
+    $(msgId).className = "bad";
+  }
+}
+$("polform").addEventListener("submit", ev => {
+  ev.preventDefault();
+  const rules = {};
+  document.querySelectorAll("select[data-rule]").forEach(s => {
+    rules[s.dataset.rule] = {on: s.value !== "off", watch: s.value === "watch"};
+  });
+  rules.opreturn.max_bytes = Number($("opmax").value);
+  rules.minfee.sat_vb = Number($("minfee").value);
+  post("api/policy", {mode: $("pmode").value, rules}, "polmsg", () => "Saved. The next job uses it.");
+});
+$("sgform").addEventListener("submit", ev => {
+  ev.preventDefault();
+  post("api/settings", {stall_guard_s: Number($("sgsec").value)}, "sgmsg",
+       j => j.stall_guard_s ? `Saved: ${j.stall_guard_s} s.` : "Saved: the stall guard is off.");
+});
+$("bkdown").addEventListener("click", async () => {
+  try {
+    const r = await fetch("api/export", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    const blob = new Blob([JSON.stringify(await r.json(), null, 2)], {type: "application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "solo45-core-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    $("bkmsg").textContent = "Downloaded.";
+    $("bkmsg").className = "good";
+  } catch (e) {
+    $("bkmsg").textContent = "Couldn't make the backup: " + e.message;
+    $("bkmsg").className = "bad";
+  }
+});
+$("bkfile").addEventListener("change", async ev => {
+  const f = ev.target.files[0];
+  ev.target.value = "";
+  if (!f) return;
+  let data;
+  try {
+    data = JSON.parse(await f.text());
+    if (data && data.pool && !data.settings) data = data.pool; // a Solo45 dashboard backup: use its pool part
+  } catch (e) {
+    $("bkmsg").textContent = "That file isn't a Solo45 backup.";
+    $("bkmsg").className = "bad";
+    return;
+  }
+  if (!confirm("Restore these settings? They replace the payout address, settings, policy and the difficulty of miners in the file.")) return;
+  post("api/restore", data, "bkmsg", j => (j.ok ? "Restored: " : "Partly restored: ") + (j.restored || []).join(", ") +
+       (j.errors && j.errors.length ? ". Problems: " + j.errors.join("; ") : "."));
+});
 async function refresh() {
   try {
     const r = await fetch("api/state", {cache: "no-store"});

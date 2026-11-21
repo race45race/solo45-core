@@ -1,14 +1,16 @@
 //! Pool-wide state: configuration, jobs, new-block detection (ZMQ signal, long-poll, tip poll), empty block
 //! first, the node's block check, payouts, found blocks, statistics and saved state.
-//! Mirrors the Pool class in Solo45's pool.py; the template policy and the stall guard are not ported yet.
+//! Mirrors the Pool class in Solo45's pool.py, with its stall guard and template policy.
 
 use crate::job::{Job, TxCache, EN1_SIZE, EN2_SIZE};
 use crate::log;
+use crate::policy;
 use crate::rpc::{shellexpand, Rpc};
+use crate::stallguard::StallGuard;
 use crate::util::{address_plausible, commas, fmt_diff, g3, hashrate, median, now_f, sha256d, target_diff};
 use crate::zmq::ZmqSub;
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::Write;
@@ -58,6 +60,7 @@ pub struct Config {
     pub empty_first: bool,
     pub empty_hold_s: f64,
     pub template_refresh_s: f64,
+    pub stall_guard_s: f64,
     pub data_dir: String,
 }
 
@@ -89,6 +92,7 @@ impl Config {
             empty_first: env("SOLO45_EMPTY_FIRST", true),
             empty_hold_s: env("SOLO45_EMPTY_HOLD_S", 10.0),
             template_refresh_s: env("SOLO45_TEMPLATE_REFRESH_S", 30.0),
+            stall_guard_s: env("SOLO45_STALL_GUARD_S", 60.0), // 0 = off
             data_dir: shellexpand(&env("SOLO45_DATA_DIR", ".".to_string())),
         }
     }
@@ -187,6 +191,112 @@ pub struct Upd {
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// The template policy's settings and what it did to recent blocks (pool.py's policy_* attributes).
+pub struct PolicyState {
+    pub cfg: Value,
+    heights: VecDeque<Value>, // the last ~144 blocks' entries, oldest first (one per height)
+    pub fallback_height: Option<u64>, // a filtered job failed the node's block check at this height
+    history: Vec<Value>,      // finished blocks, last 30 days (policy-blocks.jsonl)
+    file_lines: usize,
+    path: String,
+}
+
+const POLICY_KEEP: [&str; 13] = ["height", "at", "mode", "filtered", "txs", "fees", "skipped", "fees_skipped",
+                                 "weight_skipped", "by_rule", "watched", "fees_watched", "watch_by_rule"];
+const DAY: f64 = 86400.0;
+
+impl PolicyState {
+    fn load(cfg: Value, path: String) -> PolicyState {
+        let mut p = PolicyState { cfg, heights: VecDeque::new(), fallback_height: None, history: vec![], file_lines: 0, path };
+        let cutoff = now_f() - 30.0 * DAY;
+        let mut keep: BTreeMap<u64, Value> = BTreeMap::new();
+        if let Ok(text) = std::fs::read_to_string(&p.path) {
+            for line in text.lines() {
+                p.file_lines += 1;
+                if let Ok(e) = serde_json::from_str::<Value>(line) {
+                    if e["at"].as_f64().unwrap_or(0.0) >= cutoff {
+                        if let Some(h) = e["height"].as_u64() {
+                            keep.insert(h, e); // a later line for the same height (after a reorg) wins
+                        }
+                    }
+                }
+            }
+        }
+        p.history = keep.into_values().collect();
+        if p.file_lines > p.history.len() {
+            p.write_history();
+        }
+        for e in p.history.iter().rev().take(144).rev() {
+            let mut e = e.clone();
+            e["saved"] = json!(true);
+            p.heights.push_back(e);
+        }
+        p
+    }
+
+    fn write_history(&mut self) {
+        let tmp = format!("{}.tmp", self.path);
+        let body: String = self.history.iter().map(|e| format!("{}\n", e)).collect();
+        match std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &self.path)) {
+            Ok(()) => self.file_lines = self.history.len(),
+            Err(e) => log!("WARNING", "couldn't save the policy history: {}", e),
+        }
+    }
+
+    /// Keep a finished block's numbers, so the policy totals survive restarts and updates.
+    fn save_block(&mut self, entry: &mut Value) {
+        entry["saved"] = json!(true);
+        let mut e = Map::new();
+        for k in POLICY_KEEP {
+            e.insert(k.to_string(), entry.get(k).cloned().unwrap_or(Value::Null));
+        }
+        let cutoff = now_f() - 30.0 * DAY;
+        self.history.retain(|x| x["at"].as_f64().unwrap_or(0.0) >= cutoff);
+        let e = Value::Object(e);
+        self.history.push(e.clone());
+        if self.file_lines > self.history.len() + 144 {
+            self.write_history(); // about once a day, drop old lines from the file
+            return;
+        }
+        let r = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
+            .and_then(|mut f| writeln!(f, "{}", e));
+        match r {
+            Ok(()) => self.file_lines += 1,
+            Err(err) => log!("WARNING", "couldn't save the policy history: {}", err),
+        }
+    }
+
+    fn view(&self) -> Value {
+        let done: Vec<&Value> = self.heights.iter().filter(|e| e["saved"] == true).collect(); // found by the network
+        let current = self.heights.back().filter(|e| e["saved"] != true).cloned(); // the block being mined
+        let now = now_f();
+        let sum = |es: &[&Value], k: &str| es.iter().map(|e| e[k].as_u64().unwrap_or(0)).sum::<u64>();
+        let periods: Vec<Value> = [("24 hours", DAY), ("7 days", 7.0 * DAY), ("30 days", 30.0 * DAY)].iter().map(|(label, secs)| {
+            let es: Vec<&Value> = self.history.iter().filter(|e| e["at"].as_f64().unwrap_or(0.0) >= now - secs).collect();
+            let mut v = json!({"label": label, "seconds": secs, "blocks": es.len()});
+            for k in ["txs", "fees", "skipped", "fees_skipped", "watched", "fees_watched"] {
+                v[k] = json!(sum(&es, k));
+            }
+            v
+        }).collect();
+        let mut totals = json!({"blocks": done.len(), "skipped": sum(&done, "skipped"), "fees_skipped": sum(&done, "fees_skipped"),
+                                "by_rule": {}, "watched": sum(&done, "watched"), "fees_watched": sum(&done, "fees_watched"),
+                                "watch_by_rule": {}});
+        for e in &done {
+            for key in ["by_rule", "watch_by_rule"] {
+                for (k, v) in e[key].as_object().into_iter().flatten() {
+                    let t = &mut totals[key][k];
+                    let (txs, fees) = (t["txs"].as_u64().unwrap_or(0), t["fees"].as_u64().unwrap_or(0));
+                    *t = json!({"txs": txs + v["txs"].as_u64().unwrap_or(0), "fees": fees + v["fees"].as_u64().unwrap_or(0)});
+                }
+            }
+        }
+        json!({"mode": self.cfg["mode"], "rules": self.cfg["rules"], "names": policy::rule_names(), "current": current,
+               "recent": done.iter().rev().take(12).collect::<Vec<_>>(), "totals": totals, "periods": periods,
+               "history_since": self.history.first().map(|e| e["at"].clone()), "fallback_height": self.fallback_height})
+    }
+}
+
 fn prev_of(t: &Value) -> String {
     t["previousblockhash"].as_str().unwrap_or("").to_string()
 }
@@ -230,6 +340,8 @@ pub struct Pool {
     chain: RwLock<Option<String>>,
     pub zmq_up: AtomicBool,
     longpoll_waiting: AtomicBool,
+    guard: Mutex<StallGuard>,
+    policy: Mutex<PolicyState>,
     pub started: f64,
 }
 
@@ -254,7 +366,12 @@ impl Pool {
             state["settings"]["force_default_address"] = json!(true);
         }
         let default = (cfg.default_address.clone(), None);
+        let events = state["stall_events"].as_array().cloned().unwrap_or_default();
+        let pcfg = policy::load_config(&state["policy"]);
+        let pstate = PolicyState::load(pcfg, format!("{}/policy-blocks.jsonl", cfg.data_dir));
         Ok(Arc::new(Pool {
+            guard: Mutex::new(StallGuard::new(events)),
+            policy: Mutex::new(pstate),
             rpc,
             jobs: RwLock::new(VecDeque::new()),
             current: RwLock::new(None),
@@ -325,6 +442,10 @@ impl Pool {
 
     pub fn empty_first_on(&self) -> bool {
         self.setting("empty_first").and_then(|v| v.as_bool()).unwrap_or(self.cfg.empty_first)
+    }
+
+    pub fn stall_guard_s(&self) -> f64 {
+        self.setting("stall_guard_s").and_then(|v| v.as_f64()).unwrap_or(self.cfg.stall_guard_s)
     }
 
     pub fn empty_hold_s(&self) -> f64 {
@@ -515,10 +636,30 @@ impl Pool {
                 if filled {
                     clean = true;
                 }
+                // template policy: in filter mode work out now what the job leaves out; the counting for watch
+                // rules waits until the miners have their work (below)
+                let (pcfg, fallback) = {
+                    let p = self.policy.lock().unwrap();
+                    (p.cfg.clone(), p.fallback_height)
+                };
+                let mode = pcfg["mode"].as_str().unwrap_or("off").to_string();
+                let (mut report, mut filtered_tpl) = (None, None);
+                if mode == "filter" {
+                    let r = policy::evaluate(&tpl, &pcfg, false);
+                    if r.skipped() > 0 && fallback != tpl["height"].as_u64() {
+                        filtered_tpl = Some(policy::apply(&tpl, &r));
+                    }
+                    report = Some(r);
+                }
+                let filtered = filtered_tpl.is_some();
                 let j = {
                     let mut cache = self.tx_cache.lock().unwrap();
-                    Arc::new(Job::new(&self.next_job_id(), &tpl, self.cfg.coinbase_tag.as_bytes(), &mut cache)?)
+                    let mut j = Job::new(&self.next_job_id(), filtered_tpl.as_ref().unwrap_or(&tpl),
+                                         self.cfg.coinbase_tag.as_bytes(), &mut cache)?;
+                    j.filtered = filtered;
+                    Arc::new(j)
                 };
+                drop(filtered_tpl);
                 self.install(&j);
                 let workers = self.worker_count();
                 let _ = self.job_tx.send(NewJob { job: j.clone(), clean: clean || new_block });
@@ -532,6 +673,15 @@ impl Pool {
                 log!("INFO", "{} job {} for block {}: {:.8} BTC, {} txs, {} bytes, fees {:.4} BTC (sent to {} workers in {} ms)",
                     if new_block { "new-block" } else if filled { "full" } else { "updated" }, j.id, j.height,
                     j.value as f64 / 1e8, j.tx_data.len(), commas(bytes as u64), j.fees as f64 / 1e8, workers, ms);
+                // only counting, so it runs after the miners already have the job
+                if mode == "watch" {
+                    report = Some(policy::evaluate(&tpl, &pcfg, true));
+                } else if let Some(r) = report.as_mut() {
+                    policy::add_watch(r, &tpl, &pcfg);
+                }
+                if let Some(r) = report {
+                    self.record_policy(r, &mode, filtered);
+                }
                 job = j;
             }
             // the node fully checks every new block's work; routine refreshes less often
@@ -727,7 +877,15 @@ impl Pool {
             return;
         }
         log!("ERROR", "BLOCK PROPOSAL REJECTED at height {}: {}", job.height, res);
-        if job.empty {
+        if job.filtered {
+            log!("ERROR", "the filtered template for block {} failed the block check; mining the node's own template \
+                           for this block instead", job.height);
+            self.policy.lock().unwrap().fallback_height = Some(job.height);
+            let me = self.clone();
+            tokio::spawn(async move {
+                let _ = me.update_template(Upd { clean: true, ..Default::default() }).await;
+            });
+        } else if job.empty {
             log!("ERROR", "the empty template for block {} failed the block check; ending the hold", job.height);
             job.hold_done.notify_one();
         }
@@ -1039,7 +1197,62 @@ impl Pool {
         tokio::spawn(self.clone().longpoll_blocks());
         tokio::spawn(self.clone().refresh_templates());
         tokio::spawn(self.clone().housekeeping());
+        tokio::spawn(self.clone().stall_guard_loop());
         Ok(())
+    }
+
+    /// Every 5 s: is the node stuck on a block one peer won't send? Then drop that peer (pool.py's stall_guard_loop).
+    /// Solo45 on the same node runs the same guard; whichever acts first wins and the other's disconnect just
+    /// finds the peer already gone.
+    async fn stall_guard_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let limit = self.stall_guard_s();
+            if limit <= 0.0 {
+                continue;
+            }
+            let info = match self.rpc.call_t("getblockchaininfo", json!([]), 10).await {
+                Ok(i) => i,
+                Err(e) => {
+                    if !e.to_string().contains("\"code\":-28") { // -28: the node is still starting up
+                        log!("WARNING", "stall guard: {}", e);
+                    }
+                    continue;
+                }
+            };
+            let (blocks, headers) = (info["blocks"].as_u64().unwrap_or(0), info["headers"].as_u64().unwrap_or(0));
+            let ibd = info["initialblockdownload"].as_bool().unwrap_or(false);
+            let peers = if headers > blocks {
+                match self.rpc.call_t("getpeerinfo", json!([]), 10).await {
+                    Ok(Value::Array(p)) => p,
+                    Ok(_) => vec![],
+                    Err(e) => {
+                        log!("WARNING", "stall guard: {}", e);
+                        continue;
+                    }
+                }
+            } else {
+                vec![]
+            };
+            let (targets, note) = self.guard.lock().unwrap().check(blocks, headers, ibd, &peers, now_f(), limit);
+            if let Some(n) = note {
+                log!("WARNING", "stall guard: {}", n);
+            }
+            for (id, desc) in &targets {
+                match self.rpc.call_t("disconnectnode", json!(["", id]), 10).await {
+                    Ok(_) => log!("WARNING", "stall guard: block {} was announced over {:.0} s ago but {} still hasn't sent it; \
+                                              disconnected it so the node gets the block from another peer", blocks + 1, limit, desc),
+                    Err(e) if e.to_string().contains("\"code\":-29") =>
+                        log!("INFO", "stall guard: {} was already disconnected (Solo45's guard on the same node, or it left)", desc),
+                    Err(e) => log!("WARNING", "stall guard: couldn't disconnect {}: {}", desc, e),
+                }
+            }
+            if !targets.is_empty() {
+                let events = self.guard.lock().unwrap().events.clone();
+                self.state.lock().unwrap()["stall_events"] = json!(events);
+                let _ = self.save_state();
+            }
+        }
     }
 
     /// The stop signal: let a block on its way to the node get there, keep the state, then exit.
@@ -1089,6 +1302,12 @@ impl Pool {
         let st = self.state.lock().unwrap();
         let settings = st["settings"].clone();
         let get_f = |k: &str, d: f64| settings.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+        let stall_events: Vec<Value> = {
+            let g = self.guard.lock().unwrap();
+            g.events[g.events.len().saturating_sub(10)..].to_vec()
+        };
+        let stall_s = settings.get("stall_guard_s").and_then(|v| v.as_f64()).unwrap_or(self.cfg.stall_guard_s);
+        let policy_view = self.policy_view();
         json!({
             "now": now, "uptime": up, "engine": "solo45-core", "version": env!("CARGO_PKG_VERSION"),
             "pool": {
@@ -1105,7 +1324,7 @@ impl Pool {
                 "accepted": s.accepted,
                 "rejected": s.rejected,
                 "best": s.best,
-                "policy": {"mode": "off", "available": false},
+                "policy": policy_view,
                 "best_ever": st["best_ever"],
                 "blocks": st["blocks"],
                 "last_switch": s.last_switch,
@@ -1122,7 +1341,7 @@ impl Pool {
                 "stratum_port": self.cfg.stratum_port,
                 "template_refresh_s": get_f("template_refresh_s", self.cfg.template_refresh_s),
                 "zmq": self.zmq_up.load(Ordering::Relaxed),
-                "stall_guard": {"seconds": 0, "events": []},
+                "stall_guard": {"seconds": stall_s, "events": stall_events},
             },
             "workers": workers,
         })
@@ -1134,8 +1353,9 @@ impl Pool {
     }
 
     pub fn export_settings(&self) -> Value {
+        let pcfg = self.policy.lock().unwrap().cfg.clone();
         let st = self.state.lock().unwrap();
-        json!({"settings": st["settings"], "overrides": st["overrides"], "policy": null, "last_diff": st["last_diff"]})
+        json!({"settings": st["settings"], "overrides": st["overrides"], "policy": pcfg, "last_diff": st["last_diff"]})
     }
 
     /// Per-miner difficulty settings. Only share difficulty changes, never block odds.
@@ -1232,7 +1452,144 @@ impl Pool {
         let _ = self.save_state();
         (200, json!({"ok": true, "template_refresh_s": self.refresh_s(), "force_default_address": self.force_default(),
                      "empty_first": self.empty_first_on(), "empty_hold_s": self.empty_hold_s(),
-                     "stall_guard_s": self.setting("stall_guard_s").unwrap_or(json!(60))}))
+                     "stall_guard_s": self.stall_guard_s()}))
+    }
+
+    /// Keep what the policy did to this template (the latest per block), and log it (pool.py's record_policy).
+    fn record_policy(&self, r: policy::Report, mode: &str, filtered: bool) {
+        let mut p = self.policy.lock().unwrap();
+        if let Some(last) = p.heights.back().cloned() {
+            if r.height > last["height"].as_u64().unwrap_or(0) && last["saved"] != true {
+                let mut last = last;
+                p.save_block(&mut last); // a new block arrived, so the previous one's numbers are final
+                *p.heights.back_mut().unwrap() = last;
+            }
+        }
+        let entry = json!({"height": r.height, "mode": mode, "filtered": filtered, "txs": r.txs, "skipped": r.skipped(),
+                           "fees": r.fees, "fees_skipped": r.fees_skipped, "weight_skipped": r.weight_skipped,
+                           "by_rule": r.by_rule, "examples": r.examples, "watched": r.watched, "fees_watched": r.fees_watched,
+                           "watch_by_rule": r.watch_by_rule, "at": now_f()});
+        p.heights.retain(|e| e["height"].as_u64() != Some(r.height));
+        p.heights.push_back(entry);
+        while p.heights.len() > 144 {
+            p.heights.pop_front(); // about a day of blocks
+        }
+        drop(p);
+        let why = |by: &Value| by.as_object().into_iter().flatten()
+            .map(|(k, v)| format!("{} {}", k, v["txs"])).collect::<Vec<_>>().join(", ");
+        let text = if r.skipped() > 0 {
+            let mut t = format!("{} {} of {} txs for block {}, {} sats in fees ({})",
+                                if filtered { "skipped" } else { "would skip" }, r.skipped(), r.txs, r.height,
+                                commas(r.fees_skipped), why(&r.by_rule));
+            if r.watched > 0 {
+                t += &format!("; watch rules would also skip {} txs, {} sats ({})", r.watched, commas(r.fees_watched), why(&r.watch_by_rule));
+            }
+            t
+        } else if r.watched > 0 {
+            format!("would skip {} of {} txs for block {}, {} sats in fees ({})", r.watched, r.txs, r.height,
+                    commas(r.fees_watched), why(&r.watch_by_rule))
+        } else {
+            return;
+        };
+        log!("INFO", "policy ({}): {}", if filtered { "filtering" } else if mode == "watch" { "watch-only" }
+                                        else if r.skipped() > 0 { "fallback" } else { "watch rules" }, text);
+    }
+
+    pub fn policy_view(&self) -> Value {
+        self.policy.lock().unwrap().view()
+    }
+
+    /// A policy change from the dashboard; the next job uses it right away.
+    pub async fn set_policy(self: &Arc<Self>, data: &Value) -> (u16, Value) {
+        let cfg = {
+            let cur = self.policy.lock().unwrap().cfg.clone();
+            match policy::check_config(data, &cur) {
+                Ok(c) => c,
+                Err(e) => return (400, json!({"error": e})),
+            }
+        };
+        self.policy.lock().unwrap().cfg = cfg.clone();
+        self.state.lock().unwrap()["policy"] = cfg.clone();
+        let _ = self.save_state();
+        let states: Vec<(String, &str)> = cfg["rules"].as_object().into_iter().flatten()
+            .map(|(k, v)| (k.clone(), policy::rule_state(v))).collect();
+        let list = |s: &str| {
+            let v: Vec<&str> = states.iter().filter(|x| x.1 == s).map(|x| x.0.as_str()).collect();
+            if v.is_empty() { "none".to_string() } else { v.join(", ") }
+        };
+        log!("INFO", "template policy: mode {}, filter: {}, watch only: {}", cfg["mode"].as_str().unwrap_or("?"),
+             list("filter"), list("watch"));
+        let me = self.clone();
+        tokio::spawn(async move {
+            let _ = me.update_template(Upd::default()).await; // apply it to the next job right away
+        });
+        let mut v = self.policy_view();
+        v["ok"] = json!(true);
+        (200, v)
+    }
+
+    /// Load a backup made by export_settings (pool.py's restore_settings). Each part goes through the same checks as
+    /// a change on the dashboard; a part that fails is reported and skipped. Miners not in the backup keep theirs.
+    pub async fn restore_settings(self: &Arc<Self>, data: &Value) -> (u16, Value) {
+        let (mut done, mut errors): (Vec<String>, Vec<String>) = (vec![], vec![]);
+        let mut step = |label: String, (code, reply): (u16, Value)| {
+            if code == 200 {
+                done.push(label);
+            } else {
+                errors.push(format!("{}: {}", label, reply["error"].as_str().map(String::from).unwrap_or(code.to_string())));
+            }
+        };
+        let s = &data["settings"];
+        if let Some(a) = s["default_address"].as_str().filter(|a| !a.is_empty()) {
+            step("payout address".into(), self.set_payout(&json!({"address": a})).await);
+        }
+        let mut ps = Map::new();
+        for k in ["template_refresh_s", "stall_guard_s", "force_default_address", "empty_first", "empty_hold_s"] {
+            if let Some(v) = s.get(k) {
+                ps.insert(k.into(), v.clone());
+            }
+        }
+        if !ps.is_empty() {
+            step("job timing, stall guard, payout switch and empty block first".into(), self.set_settings(&Value::Object(ps)).await);
+        }
+        let mut miners = 0;
+        for (name, o) in data["overrides"].as_object().into_iter().flatten() {
+            if let Some(o) = o.as_object() {
+                let mut o = o.clone();
+                o.insert("name".into(), json!(name));
+                let r = self.set_override(&Value::Object(o));
+                if r.0 == 200 {
+                    miners += 1;
+                } else {
+                    step(format!("difficulty for {}", name), r);
+                }
+            }
+        }
+        if miners > 0 {
+            step(format!("difficulty settings for {} miner{}", miners, if miners == 1 { "" } else { "s" }), (200, json!({})));
+        }
+        if data["policy"].is_object() {
+            step("template policy".into(), self.set_policy(&data["policy"]).await);
+        }
+        let mut kept = 0;
+        {
+            let mut st = self.state.lock().unwrap();
+            for (name, v) in data["last_diff"].as_object().into_iter().flatten() {
+                let (Some(diff), Some(at)) = (v[0].as_f64(), v[1].as_f64()) else { continue };
+                if (self.cfg.min_diff..=MAX_DIFF).contains(&diff) {
+                    let name: String = name.chars().take(64).collect();
+                    st["last_diff"][name] = json!([diff, at]);
+                    kept += 1;
+                }
+            }
+        }
+        if kept > 0 {
+            done.push(format!("remembered difficulty for {} miner{}", kept, if kept == 1 { "" } else { "s" }));
+        }
+        let _ = self.save_state();
+        log!("INFO", "settings restored from a backup: {}{}", if done.is_empty() { "nothing".into() } else { done.join(", ") },
+             if errors.is_empty() { String::new() } else { format!("; problems: {}", errors.join("; ")) });
+        (200, json!({"ok": errors.is_empty(), "restored": done, "errors": errors}))
     }
 
     /// Point connected miners at the address they should pay now; they get it with a fresh job.

@@ -15,10 +15,17 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   node is down or still starting.
 - **Steady share difficulty.** Vardiff per miner, remembered across restarts, or a fixed difficulty or share rate
   per miner.
+- **Template policy.** Leave out inscriptions, Runes, large OP_RETURN data, bare multisig or low fee rates (judged
+  by package, child pays for parent, like the node). Each rule can be Off, Watch (only count) or Filter; a filtered
+  job that ever fails the node's check falls back to the node's own template for that block. Same results as
+  Solo45's policy, transaction for transaction.
+- **Stall guard.** If a peer announces a block but never sends it, Core disconnects that peer after 60 s
+  (adjustable), instead of your miners hashing on an old block for 10 minutes.
+- **Backup and restore** of the payout address, settings, per-miner difficulty and policy (also reads a Solo45
+  dashboard backup).
 - **Small.** One binary, about 2% of a CPU core and 40-160 MB of memory with full mainnet templates.
 
-Planned: template policy and stall guard (from Solo45), then Stratum V2, job declaration, a proxy mode and public
-stats pages.
+Planned: Stratum V2, job declaration, a proxy mode and public stats pages.
 
 ## Install on Umbrel
 
@@ -36,7 +43,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.3
+  ghcr.io/race45race/solo45-core:v0.0.4
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
@@ -59,6 +66,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_SHARE_SECONDS` | 10 | vardiff target |
 | `SOLO45_EMPTY_HOLD_S` | 10 | how long the empty job for a new block runs before the full template |
 | `SOLO45_TEMPLATE_REFRESH_S` | 30 | new job with fresh transactions |
+| `SOLO45_STALL_GUARD_S` | 60 | stall guard (0 = off; the status page setting wins) |
 
 ## Build
 
