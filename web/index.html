@@ -127,8 +127,9 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
     <div class="mono" id="sv2port">-</div>
     <div class="k" style="margin-top:8px">Authority key (miners and proxies pin this)</div>
     <div class="mono" id="sv2key">-</div>
-    <div class="s" style="margin-top:8px">This version offers extended channels (what the Translator Proxy and other proxies use).
-      Miners that mine over standard channels, such as Braiins OS, come in a later version.</div>
+    <div class="s" style="margin-top:8px">Standard channels (header-only mining: Braiins OS, AxeOS "standard") and extended channels
+      (AxeOS "extended", the Translator Proxy) both work. Braiins OS pool URL:
+      <span class="mono" id="sv2url">-</span></div>
   </div>
   </div>
 
@@ -215,6 +216,7 @@ function render(d) {
   if (sv2) {
     $("sv2port").textContent = sv2.port;
     $("sv2key").textContent = sv2.authority_pubkey;
+    $("sv2url").textContent = `stratum2+tcp://<your Umbrel's IP>:${sv2.port}/${sv2.authority_pubkey}`;
   }
   renderPolicy(p.policy || {}, now);
   renderGuard(p.stall_guard || {}, now);

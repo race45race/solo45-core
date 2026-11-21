@@ -28,14 +28,16 @@ use stratum_apps::stratum_core::channels_sv2::{
     extranonce_manager::ExtranonceAllocator,
     server::{
         extended::ExtendedChannel,
+        standard::StandardChannel,
         share_accounting::{ShareValidationError, ShareValidationResult},
     },
     Vardiff, VardiffState,
 };
 use stratum_apps::stratum_core::common_messages_sv2::{Protocol, SetupConnectionErrorOwned, SetupConnectionSuccess};
 use stratum_apps::stratum_core::mining_sv2::{
-    OpenExtendedMiningChannelSuccessOwned, OpenMiningChannelErrorOwned, SetNewPrevHashOwned as SetNewPrevHashMp,
-    SetTargetOwned, SubmitSharesErrorOwned, SubmitSharesExtendedOwned, SubmitSharesSuccessOwned,
+    OpenExtendedMiningChannelSuccessOwned, OpenMiningChannelErrorOwned, OpenStandardMiningChannelSuccessOwned,
+    SetNewPrevHashOwned as SetNewPrevHashMp, SetTargetOwned, SubmitSharesErrorOwned, SubmitSharesExtendedOwned,
+    SubmitSharesStandardOwned, SubmitSharesSuccessOwned,
 };
 use stratum_apps::stratum_core::noise_sv2::Responder;
 use stratum_apps::stratum_core::parsers_sv2::{parse_message_frame_with_tlvs, AnyMessageOwned, CommonMessagesOwned, MiningOwned};
@@ -45,7 +47,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 
 const SV2_VERSION: u16 = 2;
-const REQUIRES_EXTENDED_CHANNELS: u32 = 0x02;
 const SERVER_TAG: u8 = 0x45; // first extranonce byte on this pool ("45")
 const MAX_CHANNELS: u32 = 65_536; // 2 bytes of channel index
 const CLIENT_EXTRANONCE: u8 = 16; // the space each channel rolls itself (what the reference pool gives)
@@ -162,9 +163,31 @@ pub async fn serve(pool: Arc<Pool>, sv2: Arc<Sv2>, listener: TcpListener) {
     }
 }
 
-/// One extended channel on a connection: the reference channel state plus the miner as the pool shows it.
+/// A channel's reference state: extended (the miner builds its own coinbase/merkle root: proxies, AxeOS
+/// "extended") or standard (header-only mining: Braiins OS, AxeOS "standard").
+enum Ch {
+    Ext(ExtendedChannel),
+    Std(StandardChannel),
+}
+
+/// Run the same expression on either kind of channel (their APIs match).
+macro_rules! on {
+    ($ch:expr, $x:ident => $e:expr) => {
+        match $ch {
+            Ch::Ext($x) => $e,
+            Ch::Std($x) => $e,
+        }
+    };
+}
+
+enum Sub {
+    Ext(SubmitSharesExtendedOwned),
+    Std(SubmitSharesStandardOwned),
+}
+
+/// One channel on a connection: the reference channel state plus the miner as the pool shows it.
 struct Chan {
-    ch: ExtendedChannel,
+    ch: Ch,
     vardiff: VardiffState,
     worker_id: u64,
     info: Arc<Mutex<WorkerInfo>>,
@@ -247,7 +270,7 @@ impl Conn {
         }
         let clean = |s: &str| s.chars().filter(|c| !c.is_control()).take(40).collect::<String>();
         self.agent = format!("sv2/{}/{}", clean(&s.vendor.as_utf8_or_hex()), clean(&s.firmware.as_utf8_or_hex()));
-        let ok = SetupConnectionSuccess { used_version: SV2_VERSION, flags: REQUIRES_EXTENDED_CHANNELS };
+        let ok = SetupConnectionSuccess { used_version: SV2_VERSION, flags: 0 }; // standard and extended channels
         self.send(AnyMessageOwned::Common(ok.into())).await?;
 
         // 2. channels, shares, jobs and vardiff
@@ -284,82 +307,25 @@ impl Conn {
     async fn handle(&mut self, msg: AnyMessageOwned) -> Result<()> {
         match msg {
             AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(m)) => {
-                let user: String = m.user_identity.as_utf8_or_hex().chars().filter(|c| !c.is_control()).take(120).collect();
-                let request_id = m.request_id;
-                let refuse = |code: &str| MiningOwned::OpenMiningChannelError(OpenMiningChannelErrorOwned {
-                    request_id, error_code: code.to_string().try_into().unwrap() });
-                if self.chans.len() >= MAX_CHANNELS_PER_CONN {
-                    return self.send_mining(refuse("max-channels-reached")).await;
-                }
-                let Some((address, spk)) = self.pool.payout_for(&user).await else {
-                    log!("INFO", "refused {} {} (Stratum V2): no payout address yet", self.ip, user);
-                    return self.send_mining(refuse("unknown-user")).await;
-                };
-                let allocated = self.sv2.allocator.lock().unwrap().allocate_extended(m.min_extranonce_size as usize);
-                let prefix = match allocated {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log!("WARNING", "Stratum V2 {}: extranonce: {:?}", self.ip, e);
-                        return self.send_mining(refuse("min-extranonce-size-too-large")).await;
-                    }
-                };
-                let channel_id = self.next_channel;
-                self.next_channel += 1;
+                let user = m.user_identity.as_utf8_or_hex();
                 let max_target = Target::from_le_bytes(m.max_target.to_array());
-                let ch = ExtendedChannel::new_for_pool(channel_id, user.clone(), prefix, max_target, m.nominal_hash_rate, true,
-                                                       CLIENT_EXTRANONCE as u16, SHARE_BATCH, SHARES_PER_MINUTE,
-                                                       self.pool.cfg.coinbase_tag.clone(), None);
-                let ch = match ch {
-                    Ok(ch) => ch,
-                    Err(e) => {
-                        log!("INFO", "refused {} {} (Stratum V2): {:?}", self.ip, user, e);
-                        return self.send_mining(refuse("invalid-nominal-hashrate")).await;
-                    }
-                };
-                let ok = OpenExtendedMiningChannelSuccessOwned {
-                    request_id, channel_id,
-                    target: ch.get_target().to_le_bytes().into(),
-                    extranonce_size: ch.get_rollable_extranonce_size(),
-                    extranonce_prefix: ch.get_extranonce_prefix().to_vec().try_into().map_err(|e| anyhow!("{:?}", e))?,
-                    group_channel_id: 0,
-                };
-                self.send_mining(MiningOwned::OpenExtendedMiningChannelSuccess(ok)).await?;
-                // the miner as the API shows it: name after the first dot, like V1 usernames
-                let name = user.split_once('.').map(|(_, n)| n.to_string()).filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| if user.is_empty() { self.ip.clone() } else { user.clone() });
-                let mut info = WorkerInfo::new(&self.ip, now_f());
-                info.name = name.clone();
-                info.user = user.clone();
-                info.agent = self.agent.clone();
-                info.address = address.clone();
-                info.spk = spk.clone();
-                info.diff = ch.get_target().difficulty_float();
-                let info = Arc::new(Mutex::new(info));
-                let worker_id = self.pool.next_worker_id();
-                let (ctl_tx, _ctl_rx) = mpsc::unbounded_channel::<Ctl>();
-                self.pool.workers.lock().unwrap().insert(worker_id, WorkerHandle { info: info.clone(), ctl: ctl_tx });
-                let vardiff = VardiffState::new().map_err(|e| anyhow!("vardiff: {:?}", e))?;
-                self.chans.insert(channel_id, Chan { ch, vardiff, worker_id, info, name: name.clone(), address: address.clone(), spk, tip: String::new() });
-                log!("INFO", "authorized {} {} ({}, Stratum V2 channel {}) pays {}", self.ip, name, self.agent, channel_id, address);
-                if let Some(job) = self.pool.current() {
-                    self.push_job(channel_id, &job).await?;
-                }
-                Ok(())
+                self.open_channel(true, m.request_id, user, m.nominal_hash_rate, max_target, m.min_extranonce_size as usize).await
             }
             AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannel(m)) => {
-                let e = OpenMiningChannelErrorOwned { request_id: m.get_request_id_as_u32(),
-                                                 error_code: "standard-channels-not-supported".to_string().try_into().unwrap() };
-                self.send_mining(MiningOwned::OpenMiningChannelError(e)).await
+                let user = m.user_identity.as_utf8_or_hex();
+                let max_target = Target::from_le_bytes(m.max_target.to_array());
+                self.open_channel(false, m.get_request_id_as_u32(), user, m.nominal_hash_rate, max_target, 0).await
             }
-            AnyMessageOwned::Mining(MiningOwned::SubmitSharesExtended(s)) => self.share(s).await,
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesExtended(s)) => self.share(Sub::Ext(s)).await,
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesStandard(s)) => self.share(Sub::Std(s)).await,
             AnyMessageOwned::Mining(MiningOwned::UpdateChannel(u)) => {
                 let Some(c) = self.chans.get_mut(&u.channel_id) else { return Ok(()) };
                 let max = Target::from_le_bytes(u.max_target.to_array());
-                if c.ch.update_channel(u.nominal_hash_rate, Some(max)).is_ok() {
-                    let t = c.ch.get_target().to_le_bytes();
-                    c.info.lock().unwrap().diff = c.ch.get_target().difficulty_float();
+                if on!(&mut c.ch, x => x.update_channel(u.nominal_hash_rate, Some(max)).is_ok()) {
+                    let t = *on!(&c.ch, x => x.get_target());
+                    c.info.lock().unwrap().diff = t.difficulty_float();
                     let id = u.channel_id;
-                    self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id: id, target: t.into() })).await?;
+                    self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id: id, target: t.to_le_bytes().into() })).await?;
                 }
                 Ok(())
             }
@@ -374,6 +340,91 @@ impl Conn {
         }
     }
 
+    /// OpenExtendedMiningChannel / OpenStandardMiningChannel: payout, extranonce prefix, the reference channel, the
+    /// reply, the miner on the API, and its first job.
+    async fn open_channel(&mut self, extended: bool, request_id: u32, user: String, nominal: f32, max_target: Target,
+                          min_extranonce: usize) -> Result<()> {
+        let user: String = user.chars().filter(|c| !c.is_control()).take(120).collect();
+        let refuse = |code: &str| MiningOwned::OpenMiningChannelError(OpenMiningChannelErrorOwned {
+            request_id, error_code: code.to_string().try_into().unwrap() });
+        if self.chans.len() >= MAX_CHANNELS_PER_CONN {
+            return self.send_mining(refuse("max-channels-reached")).await;
+        }
+        let Some((address, spk)) = self.pool.payout_for(&user).await else {
+            log!("INFO", "refused {} {} (Stratum V2): no payout address yet", self.ip, user);
+            return self.send_mining(refuse("unknown-user")).await;
+        };
+        let allocated = {
+            let mut a = self.sv2.allocator.lock().unwrap();
+            if extended { a.allocate_extended(min_extranonce) } else { a.allocate_standard() }
+        };
+        let prefix = match allocated {
+            Ok(p) => p,
+            Err(e) => {
+                log!("WARNING", "Stratum V2 {}: extranonce: {:?}", self.ip, e);
+                return self.send_mining(refuse("min-extranonce-size-too-large")).await;
+            }
+        };
+        let channel_id = self.next_channel;
+        self.next_channel += 1;
+        let tag = self.pool.cfg.coinbase_tag.clone();
+        let made = if extended {
+            ExtendedChannel::new_for_pool(channel_id, user.clone(), prefix, max_target, nominal, true, CLIENT_EXTRANONCE as u16,
+                                          SHARE_BATCH, SHARES_PER_MINUTE, tag, None).map(Ch::Ext).map_err(|e| format!("{:?}", e))
+        } else {
+            StandardChannel::new_for_pool(channel_id, user.clone(), prefix, max_target, nominal, SHARE_BATCH, SHARES_PER_MINUTE,
+                                          tag, None).map(Ch::Std).map_err(|e| format!("{:?}", e))
+        };
+        let ch = match made {
+            Ok(ch) => ch,
+            Err(e) => {
+                log!("INFO", "refused {} {} (Stratum V2): {}", self.ip, user, e);
+                return self.send_mining(refuse(if e.contains("Target") { "max-target-out-of-range" } else { "invalid-nominal-hashrate" })).await;
+            }
+        };
+        let ok = match &ch {
+            Ch::Ext(c) => MiningOwned::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccessOwned {
+                request_id, channel_id,
+                target: c.get_target().to_le_bytes().into(),
+                extranonce_size: c.get_rollable_extranonce_size(),
+                extranonce_prefix: c.get_extranonce_prefix().to_vec().try_into().map_err(|e| anyhow!("{:?}", e))?,
+                group_channel_id: 0,
+            }),
+            Ch::Std(c) => MiningOwned::OpenStandardMiningChannelSuccess(OpenStandardMiningChannelSuccessOwned {
+                request_id: request_id.into(), channel_id,
+                target: c.get_target().to_le_bytes().into(),
+                extranonce_prefix: c.get_extranonce_prefix().to_vec().try_into().map_err(|e| anyhow!("{:?}", e))?,
+                group_channel_id: 0,
+            }),
+        };
+        self.send_mining(ok).await?;
+        let diff = on!(&ch, x => x.get_target().difficulty_float());
+        let kind = if extended { "extended" } else { "standard" };
+        {
+                // the miner as the API shows it: name after the first dot, like V1 usernames
+                let name = user.split_once('.').map(|(_, n)| n.to_string()).filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| if user.is_empty() { self.ip.clone() } else { user.clone() });
+                let mut info = WorkerInfo::new(&self.ip, now_f());
+                info.name = name.clone();
+                info.user = user.clone();
+                info.agent = self.agent.clone();
+                info.address = address.clone();
+                info.spk = spk.clone();
+                info.diff = diff;
+                let info = Arc::new(Mutex::new(info));
+                let worker_id = self.pool.next_worker_id();
+                let (ctl_tx, _ctl_rx) = mpsc::unbounded_channel::<Ctl>();
+                self.pool.workers.lock().unwrap().insert(worker_id, WorkerHandle { info: info.clone(), ctl: ctl_tx });
+                let vardiff = VardiffState::new().map_err(|e| anyhow!("vardiff: {:?}", e))?;
+                self.chans.insert(channel_id, Chan { ch, vardiff, worker_id, info, name: name.clone(), address: address.clone(), spk, tip: String::new() });
+                log!("INFO", "authorized {} {} ({}, Stratum V2 {} channel {}) pays {}", self.ip, name, self.agent, kind, channel_id, address);
+        }
+        if let Some(job) = self.pool.current() {
+            self.push_job(channel_id, &job).await?;
+        }
+        Ok(())
+    }
+
     /// Give one channel a Core job: a new block's job as a future template plus SetNewPrevHash, otherwise as an
     /// immediate job for the block it is already on.
     async fn push_job(&mut self, channel_id: u32, job: &Arc<Job>) -> Result<()> {
@@ -382,23 +433,27 @@ impl Conn {
         let new_block = c.tip != job.prev_hex;
         let template = new_template(job, template_id, new_block)?;
         let outputs = vec![TxOut { value: Amount::from_sat(job.value), script_pubkey: ScriptBuf::from(c.spk.clone()) }];
-        c.ch.on_new_template(template, outputs).map_err(|e| anyhow!("job for channel {}: {:?}", channel_id, e))?;
+        on!(&mut c.ch, x => x.on_new_template(template, outputs).map_err(|e| anyhow!("job for channel {}: {:?}", channel_id, e)))?;
         let mut out: Vec<MiningOwned> = Vec::new();
         if new_block {
-            let job_id = c.ch.get_future_job_id_from_template_id(template_id).ok_or_else(|| anyhow!("no future job"))?;
-            let msg = c.ch.get_future_job(job_id).ok_or_else(|| anyhow!("no future job"))?.get_job_message().clone();
-            out.push(MiningOwned::NewExtendedMiningJob(msg));
+            let job_id = on!(&c.ch, x => x.get_future_job_id_from_template_id(template_id)).ok_or_else(|| anyhow!("no future job"))?;
+            out.push(match &c.ch {
+                Ch::Ext(x) => MiningOwned::NewExtendedMiningJob(x.get_future_job(job_id).ok_or_else(|| anyhow!("no future job"))?.get_job_message().clone()),
+                Ch::Std(x) => MiningOwned::NewMiningJob(x.get_future_job(job_id).ok_or_else(|| anyhow!("no future job"))?.get_job_message().clone()),
+            });
             let mut target = job.target;
             target.reverse(); // big-endian -> the little-endian bytes SV2 uses
             let snph = SetNewPrevHashTdp { template_id, prev_hash: job.prev.into(), ntime_start: job.curtime,
                                            n_bits: job.bits, target: target.into() };
-            c.ch.on_set_new_prev_hash(snph).map_err(|e| anyhow!("new block for channel {}: {:?}", channel_id, e))?;
+            on!(&mut c.ch, x => x.on_set_new_prev_hash(snph).map_err(|e| anyhow!("new block for channel {}: {:?}", channel_id, e)))?;
             out.push(MiningOwned::SetNewPrevHash(SetNewPrevHashMp { channel_id, job_id, prev_hash: job.prev.into(),
                                                                ntime_start: job.curtime, nbits: job.bits }));
             c.tip = job.prev_hex.clone();
         } else {
-            let msg = c.ch.get_active_job().ok_or_else(|| anyhow!("no active job"))?.get_job_message().clone();
-            out.push(MiningOwned::NewExtendedMiningJob(msg));
+            out.push(match &c.ch {
+                Ch::Ext(x) => MiningOwned::NewExtendedMiningJob(x.get_active_job().ok_or_else(|| anyhow!("no active job"))?.get_job_message().clone()),
+                Ch::Std(x) => MiningOwned::NewMiningJob(x.get_active_job().ok_or_else(|| anyhow!("no active job"))?.get_job_message().clone()),
+            });
         }
         for m in out {
             self.send_mining(m).await?;
@@ -406,20 +461,26 @@ impl Conn {
         Ok(())
     }
 
-    async fn share(&mut self, s: SubmitSharesExtendedOwned) -> Result<()> {
-        let (channel_id, seq) = (s.channel_id, s.sequence_number);
+    async fn share(&mut self, sub: Sub) -> Result<()> {
+        let (channel_id, seq, job_id, version, ntime, nonce) = match &sub {
+            Sub::Ext(s) => (s.channel_id, s.sequence_number, s.job_id, s.version, s.ntime, s.nonce),
+            Sub::Std(s) => (s.channel_id, s.sequence_number, s.job_id, s.version, s.ntime, s.nonce),
+        };
+        let bad_channel = SubmitSharesErrorOwned { channel_id, sequence_number: seq,
+                                                   error_code: "invalid-channel-id".to_string().try_into().unwrap() };
         let Some(c) = self.chans.get_mut(&channel_id) else {
-            let e = SubmitSharesErrorOwned { channel_id, sequence_number: seq, error_code: "invalid-channel-id".to_string().try_into().unwrap() };
-            return self.send_mining(MiningOwned::SubmitSharesError(e)).await;
+            return self.send_mining(MiningOwned::SubmitSharesError(bad_channel)).await;
         };
         c.vardiff.increment_shares_since_last_update();
-        let credit = c.ch.get_target().difficulty_float();
-        let (version, ntime, nonce) = (s.version, s.ntime, s.nonce);
-        let job_id = s.job_id;
-        let res = c.ch.validate_share(s);
+        let credit = on!(&c.ch, x => x.get_target().difficulty_float());
+        let res = match (&mut c.ch, sub) {
+            (Ch::Ext(x), Sub::Ext(s)) => x.validate_share(s),
+            (Ch::Std(x), Sub::Std(s)) => x.validate_share(s),
+            _ => return self.send_mining(MiningOwned::SubmitSharesError(bad_channel)).await, // wrong kind for this channel
+        };
         let now = now_f();
         let ok = |c: &Chan| {
-            let a = c.ch.get_share_accounting();
+            let a = on!(&c.ch, x => x.get_share_accounting());
             SubmitSharesSuccessOwned { channel_id, last_sequence_number: a.get_last_share_sequence_number(),
                                   new_submits_accepted_count: a.get_last_batch_accepted(), new_shares_sum: a.get_last_batch_work_sum() }
         };
@@ -493,24 +554,130 @@ impl Conn {
     async fn vardiff(&mut self) -> Result<()> {
         let mut out = Vec::new();
         for (id, c) in self.chans.iter_mut() {
-            let (h, t, spm) = (c.ch.get_nominal_hashrate(), *c.ch.get_target(), c.ch.get_shares_per_minute());
+            let (h, t, spm) = on!(&c.ch, x => (x.get_nominal_hashrate(), *x.get_target(), x.get_shares_per_minute()));
             let Ok(Some(new_h)) = c.vardiff.try_vardiff(h, &t, spm) else {
-                c.ch.set_stable_hashrate(true);
+                on!(&mut c.ch, x => x.set_stable_hashrate(true));
                 continue;
             };
-            c.ch.set_stable_hashrate(false);
-            if c.ch.update_channel(new_h, None).is_ok() {
-                let d = c.ch.get_target().difficulty_float();
+            on!(&mut c.ch, x => x.set_stable_hashrate(false));
+            if on!(&mut c.ch, x => x.update_channel(new_h, None).is_ok()) {
+                let t = *on!(&c.ch, x => x.get_target());
+                let d = t.difficulty_float();
                 let old = c.info.lock().unwrap().diff;
                 c.info.lock().unwrap().diff = d;
                 log!("INFO", "{} difficulty {} -> {} (Stratum V2)", c.name, crate::util::fmt_diff(old), crate::util::fmt_diff(d));
-                out.push(SetTargetOwned { channel_id: *id, target: c.ch.get_target().to_le_bytes().into() });
+                out.push(SetTargetOwned { channel_id: *id, target: t.to_le_bytes().into() });
             }
         }
         for m in out {
             self.send_mining(MiningOwned::SetTarget(m)).await?;
         }
         Ok(())
+    }
+}
+
+/// Test miner for standard channels (header-only mining, like Braiins OS): connects over encrypted SV2, opens a
+/// standard channel, mines `shares` shares on the CPU and prints each result. On regtest every share is a block.
+///   solo45-core sv2-miner <host:port> <authority pubkey> <user identity> <shares>
+pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32) -> Result<()> {
+    use stratum_apps::stratum_core::common_messages_sv2::SetupConnectionOwned;
+    use stratum_apps::stratum_core::mining_sv2::OpenStandardMiningChannelOwned;
+    use stratum_apps::stratum_core::noise_sv2::Initiator;
+    let key: Secp256k1PublicKey = pubkey.parse().map_err(|e| anyhow!("authority key: {:?}", e))?;
+    let init = Initiator::from_raw_k(key.into_bytes()).map_err(|e| anyhow!("initiator: {:?}", e))?;
+    let stream = TcpStream::connect(addr).await?;
+    let noise = NoiseTcpStream::connect(stream, init, HANDSHAKE_TIMEOUT).await.map_err(|e| anyhow!("handshake: {:?}", e))?;
+    let (mut r, mut w) = noise.into_split();
+    let send = |m: AnyMessageOwned| -> Result<OutboundFrame> { OutboundFrame::from_message(m).map_err(|e| anyhow!("{:?}", e)) };
+    let s = |t: &str| -> Result<_> { t.to_string().try_into().map_err(|e| anyhow!("{:?}", e)) };
+    let setup = SetupConnectionOwned { protocol: Protocol::MiningProtocol, min_version: 2, max_version: 2, flags: 0,
+        endpoint_host: s("")?, endpoint_port: 0, vendor: s("solo45-test")?, hardware_version: s("cpu")?,
+        firmware: s("solo45-core-test")?, device_id: s("1")? };
+    w.write_frame(send(AnyMessageOwned::Common(setup.into()))?).await.map_err(|e| anyhow!("{:?}", e))?;
+    let open = OpenStandardMiningChannelOwned { request_id: 7u32.into(), user_identity: s(user)?, nominal_hash_rate: 1e5,
+                                                max_target: [0xffu8; 32].into() };
+    let mut opened = false;
+    let (mut channel, mut target, mut job): (u32, [u8; 32], Option<(u32, u32, [u8; 32])>) = (0, [0xff; 32], None);
+    let (mut prev, mut ntime, mut nbits): (Option<[u8; 32]>, u32, u32) = (None, 0, 0);
+    let mut jobs: HashMap<u32, (u32, [u8; 32])> = HashMap::new(); // job_id -> (version, merkle root)
+    let (mut sent, mut seq) = (0u32, 0u32);
+    let mut nonce_base = 0u32;
+    loop {
+        let mut f = tokio::time::timeout(Duration::from_secs(30), r.read_frame()).await
+            .map_err(|_| anyhow!("no message for 30 s"))?.map_err(|e| anyhow!("{:?}", e))?;
+        let header = f.header();
+        let msg = parse_message_frame_with_tlvs(header, f.payload(), &[]).map_err(|e| anyhow!("{:?}", e))?.0.into_owned();
+        match msg {
+            AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(m)) => {
+                println!("SetupConnectionSuccess version {} flags {:#x}", m.used_version, m.flags);
+                w.write_frame(send(AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannel(open.clone())))?).await.map_err(|e| anyhow!("{:?}", e))?;
+            }
+            AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannelSuccess(m)) => {
+                channel = m.channel_id;
+                target = m.target.to_array();
+                opened = true;
+                println!("OpenStandardMiningChannelSuccess channel {} extranonce_prefix {}", channel, hex::encode(m.extranonce_prefix.as_ref()));
+            }
+            AnyMessageOwned::Mining(MiningOwned::OpenMiningChannelError(m)) => {
+                return Err(anyhow!("channel refused: {}", m.error_code.as_utf8_or_hex()));
+            }
+            AnyMessageOwned::Mining(MiningOwned::SetTarget(m)) => target = m.target.to_array(),
+            AnyMessageOwned::Mining(MiningOwned::NewMiningJob(m)) => {
+                jobs.insert(m.job_id, (m.version, m.merkle_root.to_array()));
+                if m.ntime_start.clone().into_inner().is_some() {
+                    job = Some((m.job_id, m.version, m.merkle_root.to_array())); // for the current block: mine it now
+                }
+            }
+            AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(m)) => {
+                prev = Some(m.prev_hash.to_array());
+                ntime = m.ntime_start;
+                nbits = m.nbits;
+                job = jobs.get(&m.job_id).map(|(v, root)| (m.job_id, *v, *root));
+            }
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(m)) => {
+                println!("SubmitSharesSuccess last seq {} accepted {}", m.last_sequence_number, m.new_submits_accepted_count);
+                if sent >= shares {
+                    return Ok(());
+                }
+            }
+            AnyMessageOwned::Mining(MiningOwned::SubmitSharesError(m)) => {
+                println!("SubmitSharesError seq {}: {}", m.sequence_number, m.error_code.as_utf8_or_hex());
+                if sent >= shares {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        // mine one share on the current job, then wait for the answer (and new work, on regtest)
+        if let (true, Some((job_id, version, root)), Some(p)) = (opened, job, prev) {
+            if sent < shares && seq == sent {
+                let mut hdr = Vec::with_capacity(80);
+                hdr.extend(version.to_le_bytes());
+                hdr.extend(p);
+                hdr.extend(root);
+                hdr.extend(ntime.to_le_bytes());
+                hdr.extend(nbits.to_le_bytes());
+                let mut tgt = target;
+                tgt.reverse(); // compare as big-endian numbers
+                for n in nonce_base.. {
+                    let mut h = hdr.clone();
+                    h.extend(n.to_le_bytes());
+                    let mut d = crate::util::sha256d(&h);
+                    d.reverse();
+                    if d <= tgt {
+                        let sub = stratum_apps::stratum_core::mining_sv2::SubmitSharesStandardOwned {
+                            channel_id: channel, sequence_number: seq, job_id, nonce: n, ntime, version };
+                        w.write_frame(send(AnyMessageOwned::Mining(MiningOwned::SubmitSharesStandard(sub)))?).await.map_err(|e| anyhow!("{:?}", e))?;
+                        println!("share {} on job {}: nonce {} hash {}", seq, job_id, n, hex::encode(d));
+                        nonce_base = n.wrapping_add(1);
+                        seq += 1;
+                        sent += 1;
+                        job = None; // on regtest that share was a block: wait for the next block's work
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 

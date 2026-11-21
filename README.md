@@ -24,13 +24,15 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
 - **Backup and restore** of the payout address, settings, per-miner difficulty and policy (also reads a Solo45
   dashboard backup).
 - **Stratum V2** (encrypted, on its own port), built on the Stratum V2 reference implementation's crates: Noise
-  handshake with this pool's authority key, extended channels, the reference share checks and vardiff. Same work,
-  payout and block checks as the V1 port; found blocks take the same save-first path. Stratum V1 miners such as
-  Bitaxes can use it through the reference Translator Proxy. Tested end to end on a private regtest chain (blocks
-  with segwit transactions accepted by the node) and on mainnet templates.
+  handshake with this pool's authority key, standard channels (header-only mining: Braiins OS, AxeOS "standard")
+  and extended channels (AxeOS "extended", the reference Translator Proxy), the reference share checks and vardiff.
+  Same work, payout and block checks as the V1 port; found blocks take the same save-first path. Tested end to end
+  on a private regtest chain (blocks with segwit transactions accepted by the node, over both channel types) and on
+  mainnet templates. `solo45-core sv2-miner <host:port> <authority key> <user> <shares>` is a small CPU test miner
+  for standard channels.
 - **Small.** One binary, about 2% of a CPU core and 40-160 MB of memory with full mainnet templates.
 
-Planned: Stratum V2 standard channels, job declaration, a proxy mode and public stats pages.
+Planned: job declaration, a proxy mode and public stats pages.
 
 ## Install on Umbrel
 
@@ -48,7 +50,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.6
+  ghcr.io/race45race/solo45-core:v0.0.7
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
