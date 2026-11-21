@@ -43,6 +43,7 @@ pub struct Config {
     pub stratum_port: u16,
     pub api_port: u16,
     pub web_port: u16,
+    pub sv2_port: u16,
     pub web_readers: Vec<std::net::Ipv4Addr>,
     pub api_token: String,
     pub rpc_url: String,
@@ -76,6 +77,7 @@ impl Config {
             stratum_port: env("SOLO45_STRATUM_PORT", 3346),
             api_port: env("SOLO45_API_PORT", 3386),
             web_port: env("SOLO45_WEB_PORT", 0), // the status page; 0 = off (the Umbrel app sets 8346)
+            sv2_port: env("SOLO45_SV2_PORT", 0), // Stratum V2 (encrypted); 0 = off
             web_readers: std::env::var("SOLO45_WEB_READERS").unwrap_or_default().split(',')
                 .filter_map(|s| s.trim().parse().ok()).collect(), // e.g. the Solo45 dashboard's container
             api_token: env("SOLO45_API_TOKEN", String::new()),
@@ -345,6 +347,8 @@ pub struct Pool {
     longpoll_waiting: AtomicBool,
     guard: Mutex<StallGuard>,
     policy: Mutex<PolicyState>,
+    /// the Stratum V2 port and authority key, for the API (set at start when SV2 is on)
+    pub sv2_info: RwLock<Value>,
     pub started: f64,
 }
 
@@ -375,6 +379,7 @@ impl Pool {
         Ok(Arc::new(Pool {
             guard: Mutex::new(StallGuard::new(events)),
             policy: Mutex::new(pstate),
+            sv2_info: RwLock::new(Value::Null),
             rpc,
             jobs: RwLock::new(VecDeque::new()),
             current: RwLock::new(None),
@@ -1311,6 +1316,7 @@ impl Pool {
         };
         let stall_s = settings.get("stall_guard_s").and_then(|v| v.as_f64()).unwrap_or(self.cfg.stall_guard_s);
         let policy_view = self.policy_view();
+        let sv2_info = self.sv2_info.read().unwrap().clone();
         json!({
             "now": now, "uptime": up, "engine": "solo45-core", "version": env!("CARGO_PKG_VERSION"),
             "pool": {
@@ -1342,6 +1348,7 @@ impl Pool {
                 "needs_setup": self.default.read().unwrap().1.is_none(),
                 "tag": self.cfg.coinbase_tag,
                 "stratum_port": self.cfg.stratum_port,
+                "sv2": sv2_info,
                 "template_refresh_s": get_f("template_refresh_s", self.cfg.template_refresh_s),
                 "zmq": self.zmq_up.load(Ordering::Relaxed),
                 "stall_guard": {"seconds": stall_s, "events": stall_events},

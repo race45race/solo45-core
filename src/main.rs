@@ -6,6 +6,8 @@
 //!   solo45-core job <template.json> <tag> <spk_hex>
 //!                                            print the job built from a saved template (for the pool.py cross-check)
 
+#![recursion_limit = "256"] // the API snapshot is one large json! object
+
 mod api;
 mod job;
 mod pool;
@@ -13,6 +15,7 @@ mod policy;
 mod rpc;
 mod stallguard;
 mod stratum;
+mod sv2;
 mod util;
 mod zmq;
 
@@ -58,6 +61,13 @@ async fn serve() -> Result<()> {
     if cfg.web_port != 0 {
         let web = tokio::net::TcpListener::bind(("0.0.0.0", cfg.web_port)).await?;
         tokio::spawn(api::serve(pool.clone(), web, api::Kind::Web));
+    }
+    if cfg.sv2_port != 0 {
+        let sv2 = sv2::Sv2::new(&cfg.data_dir)?;
+        let l = tokio::net::TcpListener::bind(("0.0.0.0", cfg.sv2_port)).await?;
+        *pool.sv2_info.write().unwrap() = json!({"port": cfg.sv2_port, "authority_pubkey": sv2.authority.public.to_string()});
+        log!("INFO", "Stratum V2 on :{} (authority key {})", cfg.sv2_port, sv2.authority.public);
+        tokio::spawn(sv2::serve(pool.clone(), sv2, l));
     }
     log!("INFO", "Solo45 Core {}: stratum on :{}, api on :{}{}, height {}, pays {} by default{}",
         env!("CARGO_PKG_VERSION"), cfg.stratum_port, cfg.api_port,

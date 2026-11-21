@@ -1,6 +1,6 @@
 [package]
 name = "solo45-core"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 description = "Solo45 Core: a fast solo Bitcoin mining pool (Stratum V1 first, Stratum V2 later)"
 license = "MIT"
@@ -12,6 +12,8 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 anyhow = "1"
+# Stratum V2: the reference implementation's crates (Noise, framing, messages, pool-side channels)
+stratum-apps = { version = "0.9", default-features = false, features = ["network", "core", "std"] }
 
 [profile.release]
 lto = true

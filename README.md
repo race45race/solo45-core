@@ -23,9 +23,14 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   (adjustable), instead of your miners hashing on an old block for 10 minutes.
 - **Backup and restore** of the payout address, settings, per-miner difficulty and policy (also reads a Solo45
   dashboard backup).
+- **Stratum V2** (encrypted, on its own port), built on the Stratum V2 reference implementation's crates: Noise
+  handshake with this pool's authority key, extended channels, the reference share checks and vardiff. Same work,
+  payout and block checks as the V1 port; found blocks take the same save-first path. Stratum V1 miners such as
+  Bitaxes can use it through the reference Translator Proxy. Tested end to end on a private regtest chain (blocks
+  with segwit transactions accepted by the node) and on mainnet templates.
 - **Small.** One binary, about 2% of a CPU core and 40-160 MB of memory with full mainnet templates.
 
-Planned: Stratum V2, job declaration, a proxy mode and public stats pages.
+Planned: Stratum V2 standard channels, job declaration, a proxy mode and public stats pages.
 
 ## Install on Umbrel
 
@@ -43,7 +48,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.5
+  ghcr.io/race45race/solo45-core:v0.0.6
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
@@ -56,6 +61,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_STRATUM_PORT` | 3346 | port for miners |
 | `SOLO45_API_PORT` | 3386 | Solo45-compatible API (local or `X-Solo45-Token`) |
 | `SOLO45_WEB_PORT` | 0 (off) | status page |
+| `SOLO45_SV2_PORT` | 0 (off) | Stratum V2 port (the authority key is made on first start, in sv2-authority.json) |
 | `SOLO45_WEB_READERS` | | addresses that may read the status and share feed on the status page's port (the Solo45 dashboard) |
 | `SOLO45_API_TOKEN` | | shared secret for the API |
 | `SOLO45_DATA_DIR` | . | state.json, blocks_found.jsonl |

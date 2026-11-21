@@ -117,6 +117,21 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
     <div id="sgev" class="s" style="margin-top:6px"></div>
   </div>
 
+  <div id="sv2wrap" hidden>
+  <h2>Stratum V2</h2>
+  <div class="card">
+    <div class="s">An encrypted mining port. Miners that speak Stratum V2, or the Stratum V2 Translator Proxy in front of
+      Stratum V1 miners such as Bitaxes, connect here and check this pool's key, so nobody on the way can read or change
+      their work. Same work, same payout address and same block checks as the Stratum V1 port.</div>
+    <div class="k" style="margin-top:10px">Port</div>
+    <div class="mono" id="sv2port">-</div>
+    <div class="k" style="margin-top:8px">Authority key (miners and proxies pin this)</div>
+    <div class="mono" id="sv2key">-</div>
+    <div class="s" style="margin-top:8px">This version offers extended channels (what the Translator Proxy and other proxies use).
+      Miners that mine over standard channels, such as Braiins OS, come in a later version.</div>
+  </div>
+  </div>
+
   <h2>Backup</h2>
   <div class="card">
     <div class="s">Your payout address, settings, per-miner difficulty and template policy, in one file (no statistics or logs).</div>
@@ -195,6 +210,12 @@ function render(d) {
   $("blocks").innerHTML = blocks.map(b => `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(b.worker)}</td>` +
     `<td>${esc(btc(b.value || 0))}</td><td class="${b.result == null ? "good" : "bad"}">${esc(b.result == null ? "accepted" : b.result)}</td>` +
     `<td>${esc(ago(b.at, now))}</td></tr>`).join("");
+  const sv2 = p.sv2;
+  $("sv2wrap").hidden = !sv2;
+  if (sv2) {
+    $("sv2port").textContent = sv2.port;
+    $("sv2key").textContent = sv2.authority_pubkey;
+  }
   renderPolicy(p.policy || {}, now);
   renderGuard(p.stall_guard || {}, now);
   if (!formsFilled) fillForms(p);
