@@ -478,8 +478,11 @@ impl Conn {
 
     /// Give one channel a Core job: a new block's job as a future template plus SetNewPrevHash, otherwise as an
     /// immediate job for the block it is already on. When the earlier work must not be used any more (`flush`: the
-    /// node refused that job) or the miner's payout changed, the job goes out like a new block's, with SetNewPrevHash
-    /// for the same block: the miner drops its old jobs, and shares on them are refused as stale (V1's clean_jobs).
+    /// node refused that job), the job goes out like a new block's, with SetNewPrevHash for the same block: the miner
+    /// drops its old jobs, and shares on them are refused as stale (V1's clean_jobs). A payout change does NOT flush:
+    /// the new job (new address) becomes the active one at once, but a late share on an older job is still accepted,
+    /// and if it is a block it is still submitted (it pays the old address), as on V1. Flushing there would refuse a
+    /// real block found in the moment of the change.
     async fn push_job(&mut self, channel_id: u32, job: &Arc<Job>, flush: bool) -> Result<()> {
         let Some(c) = self.chans.get_mut(&channel_id) else { return Ok(()) };
         let (spk, address) = {
@@ -494,7 +497,7 @@ impl Conn {
             c.address = address;
         }
         let template_id = u64::from_str_radix(&job.id, 16).unwrap_or(0);
-        let new_block = c.tip != job.prev_hex || flush || repay;
+        let new_block = c.tip != job.prev_hex || flush;
         let template = new_template(job, template_id, new_block)?;
         let outputs = vec![TxOut { value: Amount::from_sat(job.value), script_pubkey: ScriptBuf::from(c.spk.clone()) }];
         on!(&mut c.ch, x => x.on_new_template(template, outputs).map_err(|e| anyhow!("job for channel {}: {:?}", channel_id, e)))?;
@@ -752,6 +755,7 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
         }
     });
     let mut resume_at: Option<tokio::time::Instant> = None;
+    let sticky = std::env::var("SOLO45_TEST_STICKY").map_or(false, |v| v == "1");
     let send = |m: AnyMessageOwned| -> Result<OutboundFrame> { OutboundFrame::from_message(m).map_err(|e| anyhow!("{:?}", e)) };
     let s = |t: &str| -> Result<_> { t.to_string().try_into().map_err(|e| anyhow!("{:?}", e)) };
     let setup = SetupConnectionOwned { protocol: Protocol::MiningProtocol, min_version: 2, max_version: 2, flags: 0,
@@ -794,7 +798,8 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
             AnyMessageOwned::Mining(MiningOwned::SetTarget(m)) => target = m.target.to_array(),
             AnyMessageOwned::Mining(MiningOwned::NewMiningJob(m)) => {
                 jobs.insert(m.job_id, (m.version, m.merkle_root.to_array()));
-                if m.ntime_start.clone().into_inner().is_some() {
+                // SOLO45_TEST_STICKY=1: keep mining the job it has (tests: a late share on an older job of the same block)
+                if m.ntime_start.clone().into_inner().is_some() && !(sticky && job.is_some()) {
                     job = Some((m.job_id, m.version, m.merkle_root.to_array())); // for the current block: mine it now
                 }
             }

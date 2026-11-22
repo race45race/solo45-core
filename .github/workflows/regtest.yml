@@ -49,7 +49,7 @@ jobs:
           python3 tools/test_sv2.py
       - name: Stratum V2 standard channels
         run: bash tools/test_sv2_standard.sh
-      - name: Stratum V2 work replaced at once (payout change; same path as a job the node refuses)
+      - name: Stratum V2 payout change (new work at once; a late block on the older job still counts)
         run: bash tools/test_sv2_repay.sh
       - name: Stratum V2 when the node refuses a filtered job
         run: python3 tools/test_sv2_refused.py
