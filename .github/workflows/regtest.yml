@@ -39,6 +39,8 @@ jobs:
           python3 tools/test_regtest_blocks.py "$(cat ~/solo45-test/core-regtest/address.txt)" ~/solo45-test/core-regtest "$(cat ~/solo45-test/core-regtest/token.txt)"
       - name: The node refuses a found block
         run: python3 tools/test_node_reject.py
+      - name: A found block survives Core stopping while it sends it
+        run: python3 tools/test_resume_block.py
       - name: Stall guard
         run: python3 tools/test_stallguard.py
       - name: Stratum V2 extended channels through the Translator Proxy

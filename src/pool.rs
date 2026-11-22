@@ -938,14 +938,21 @@ impl Pool {
         h.reverse();
         let hash = hex::encode(h);
         log!("CRITICAL", "BLOCK FOUND by {} ({}) at height {}: {}", worker, ip, job.height, hash);
-        let mut record = json!({"height": job.height, "hash": hash, "worker": worker, "ip": ip, "address": address,
-                                "diff": share_diff, "value": job.value, "at": now_f()});
+        let record = json!({"height": job.height, "hash": hash, "worker": worker, "ip": ip, "address": address,
+                            "diff": share_diff, "value": job.value, "at": now_f()});
         let mut sending = record.clone();
         sending["result"] = json!("sending");
         sending["hex"] = json!(block_hex);
         self.save_found(&sending); // on disk before it goes to the node
+        self.submit_and_record(record, block_hex, false).await;
+    }
+
+    /// Send a saved block to the node until it answers (see SUBMIT_GIVE_UP_S), then record the answer: in
+    /// blocks_found.jsonl, the API's block list, and a fresh job. `resent`: it may have reached the node before (a
+    /// block resumed after a restart), so "duplicate" means it got there.
+    async fn submit_and_record(self: Arc<Self>, mut record: Value, block_hex: String, mut resent: bool) {
+        let hash = record["hash"].as_str().unwrap_or("").to_string();
         self.submitting.fetch_add(1, Ordering::SeqCst);
-        let mut resent = false;
         let mut result: Value;
         let t0 = Instant::now();
         let mut attempt = 0u32;
@@ -1003,6 +1010,52 @@ impl Pool {
         });
     }
 
+    /// At start: a block saved as "sending" whose answer never came (Core stopped while sending it, or gave up while
+    /// the node was down) goes to the node again if it can still count: it is for the next block, or the node's
+    /// newest block (it may already have it: then "duplicate" = it got there). Older ones are recorded as stale, so
+    /// they aren't looked at again.
+    async fn resume_unsent(self: Arc<Self>) {
+        let path = format!("{}/blocks_found.jsonl", self.cfg.data_dir);
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let mut last: Vec<(String, Value)> = Vec::new(); // the latest entry per block hash, in file order
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let Some(h) = v["hash"].as_str().map(String::from) else { continue };
+            last.retain(|(k, _)| *k != h);
+            last.push((h, v));
+        }
+        let unsent: Vec<Value> = last.into_iter().map(|(_, v)| v).filter(|v| v["result"] == json!("sending") && v["hex"].is_string()).collect();
+        if unsent.is_empty() {
+            return;
+        }
+        let tip = match self.rpc.call_t("getblockcount", json!([]), 10).await {
+            Ok(v) => v.as_u64().unwrap_or(0),
+            Err(e) => {
+                log!("CRITICAL", "{} saved block(s) were never answered by the node, and it can't be asked now: {}", unsent.len(), e);
+                return;
+            }
+        };
+        for v in unsent {
+            let height = v["height"].as_u64().unwrap_or(0);
+            let hash = v["hash"].as_str().unwrap_or("").to_string();
+            let hex = v["hex"].as_str().unwrap_or("").to_string();
+            let mut record = v.clone();
+            record.as_object_mut().map(|o| {
+                o.remove("hex");
+                o.remove("result");
+            });
+            if height + 1 >= tip && height <= tip + 1 {
+                log!("CRITICAL", "block {} at height {} was saved but never answered (Core stopped while sending it): sending it again", hash, height);
+                tokio::spawn(self.clone().submit_and_record(record, hex, true));
+            } else {
+                log!("WARNING", "block {} at height {} was saved but never answered; the chain is at {} now, so it can't count: recorded as stale", hash, height, tip);
+                record["result"] = json!("stale: never answered (Core stopped while sending it)");
+                let mut full = record.clone();
+                full["hex"] = json!(hex);
+                self.save_found(&full);
+            }
+        }
+    }
     // ------------------------------------------------------------------ share statistics
 
     fn log_share(s: &mut Stats, name: &str, diff: Option<f64>, share: Option<f64>, rejected: Option<&str>, block: bool) {
@@ -1318,6 +1371,7 @@ impl Pool {
         tokio::spawn(self.clone().watch_blocks());
         tokio::spawn(self.clone().longpoll_blocks());
         tokio::spawn(self.clone().refresh_templates());
+        tokio::spawn(self.clone().resume_unsent()); // a found block Core stopped sending, if any
         self.load_history();
         tokio::spawn(self.clone().housekeeping());
         tokio::spawn(self.clone().stall_guard_loop());
