@@ -27,8 +27,13 @@ pub const MAX_CONNS: usize = 2000;
 pub const AUTH_WINDOW_S: f64 = 120.0;
 pub const SPK_CACHE_MAX: usize = 5000;
 pub const MAX_AUTHORIZE: u32 = 10;
+/// A found block goes to the node again while it can't be reached or is still starting: every SUBMIT_RETRY_S for the
+/// first SUBMIT_TRIES tries, then every SUBMIT_SLOW_S, until SUBMIT_GIVE_UP_S (a node restart can take minutes; after
+/// ~10 minutes the next block has usually been found). The node's own verdict ends it at once.
 pub const SUBMIT_TRIES: u32 = 6;
 pub const SUBMIT_RETRY_S: f64 = 2.0;
+pub const SUBMIT_SLOW_S: f64 = 5.0;
+pub const SUBMIT_GIVE_UP_S: f64 = 600.0;
 pub const MAX_JOBS: usize = 40;
 
 /// Stand-in payout script for block checks before any payout address is known.
@@ -924,7 +929,7 @@ impl Pool {
         }
     }
 
-    /// Save, then submit a found block: up to SUBMIT_TRIES tries while the node can't be reached or is starting;
+    /// Save, then submit a found block: tries again while the node can't be reached or is starting (see SUBMIT_GIVE_UP_S);
     /// the node's own verdict ends it. "duplicate" after a resend means an earlier try got through.
     pub async fn found_block(self: Arc<Self>, worker: String, ip: String, address: String, job: Arc<Job>,
                              header: [u8; 80], coinbase: Vec<u8>, share_diff: f64) {
@@ -941,8 +946,11 @@ impl Pool {
         self.save_found(&sending); // on disk before it goes to the node
         self.submitting.fetch_add(1, Ordering::SeqCst);
         let mut resent = false;
-        let mut result = Value::Null;
-        for attempt in 1..=SUBMIT_TRIES {
+        let mut result: Value;
+        let t0 = Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
             match self.rpc.call_t("submitblock", json!([block_hex]), 60).await {
                 Ok(v) => {
                     result = v;
@@ -956,11 +964,16 @@ impl Pool {
                         break; // the node's own answer: sending it again won't change it
                     }
                     resent = true;
-                    log!("CRITICAL", "submitblock {}, try {} of {} failed: {}{}", hash, attempt, SUBMIT_TRIES, msg,
-                        if attempt < SUBMIT_TRIES { "; trying again" } else { "" });
-                    if attempt < SUBMIT_TRIES {
-                        tokio::time::sleep(Duration::from_secs_f64(SUBMIT_RETRY_S)).await;
+                    let more = t0.elapsed().as_secs_f64() < SUBMIT_GIVE_UP_S;
+                    if attempt <= SUBMIT_TRIES || attempt % 12 == 0 || !more { // every try at first, then about once a minute
+                        log!("CRITICAL", "submitblock {}, try {} failed: {}{}", hash, attempt, msg,
+                            if more { "; trying again" } else { "; giving up after 10 minutes (the block is saved in blocks_found.jsonl)" });
                     }
+                    if !more {
+                        break;
+                    }
+                    let gap = if attempt < SUBMIT_TRIES { SUBMIT_RETRY_S } else { SUBMIT_SLOW_S };
+                    tokio::time::sleep(Duration::from_secs_f64(gap)).await;
                 }
             }
         }

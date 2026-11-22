@@ -117,7 +117,7 @@ def main():
     check("test node stopped", down, f"after {time.time() - t0:.1f} s")
     r = tm.submit(c, job, en2, ntime, nonce)
     check("the block share is accepted while the node is down", r["result"] is True, r)
-    time.sleep(3)  # let Core fail at least once
+    time.sleep(15)  # down longer than Core's first 6 quick tries (~10 s): it must keep trying (0.0.14)
     subprocess.Popen([f"{BIN}/bitcoind", "-regtest", f"-datadir={NODE_DIR}", "-daemon"], stdout=subprocess.DEVNULL)
     t0 = time.time()
     tip = None
@@ -130,8 +130,8 @@ def main():
     time.sleep(1)
     log = open(os.path.join(CORE_DIR, "pool.log")).read()
     tries = log.count(f"submitblock {bhash}, try")
-    check("Core retried while the node was down, then the node accepted it",
-          tries >= 1 and f"submitblock {bhash}: accepted by the node" in log, f"{tries} failed tries logged")
+    check("Core kept trying while the node was down (past the first 6 quick tries), then the node accepted it",
+          tries >= 6 and f"submitblock {bhash}: accepted by the node" in log, f"{tries} failed tries logged")
     passed = sum(1 for _, ok in tm.results if ok)
     print(f"\n{passed}/{len(tm.results)} checks passed")
     return 0 if passed == len(tm.results) else 1

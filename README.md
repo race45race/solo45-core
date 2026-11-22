@@ -13,8 +13,8 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
 - **Fast block switching.** New blocks arrive by ZMQ the moment your node has them; miners get an empty job for
   the new height within a few milliseconds, then the full template.
 - **Every job checked by your node** (`getblocktemplate` proposal mode).
-- **Safe block submission.** A found block is saved to disk first, then sent, and resent up to 6 times if the
-  node is down or still starting.
+- **Safe block submission.** A found block is saved to disk first, then sent, and resent for up to 10 minutes
+  while the node is down or still starting (a node restart can take minutes). The node's own answer ends it.
 - **Steady share difficulty.** Vardiff per miner, remembered across restarts, or a fixed difficulty or share rate
   per miner.
 - **Template policy.** Leave out inscriptions, Runes, large OP_RETURN data, bare multisig or low fee rates (judged
@@ -58,7 +58,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.13
+  ghcr.io/race45race/solo45-core:v0.0.14
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
