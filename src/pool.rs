@@ -49,7 +49,8 @@ pub struct Config {
     pub api_port: u16,
     pub web_port: u16,
     pub sv2_port: u16,
-    pub web_readers: Vec<std::net::Ipv4Addr>,
+    /// SOLO45_WEB_READERS: addresses or container names (resolved every minute: an app without a fixed IP)
+    pub web_readers: Vec<String>,
     pub api_token: String,
     pub rpc_url: String,
     pub rpc_cookie: String,
@@ -84,7 +85,7 @@ impl Config {
             web_port: env("SOLO45_WEB_PORT", 0), // the status page; 0 = off (the Umbrel app sets 8346)
             sv2_port: env("SOLO45_SV2_PORT", 0), // Stratum V2 (encrypted); 0 = off
             web_readers: std::env::var("SOLO45_WEB_READERS").unwrap_or_default().split(',')
-                .filter_map(|s| s.trim().parse().ok()).collect(), // e.g. the Solo45 dashboard's container
+                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(), // e.g. the Solo45 dashboard's container
             api_token: env("SOLO45_API_TOKEN", String::new()),
             rpc_url: env("BITCOIN_RPC_URL", "http://127.0.0.1:8332/".to_string()),
             rpc_cookie: env("BITCOIN_RPC_COOKIE", "~/umbrel/app-data/bitcoin/data/bitcoin/.cookie".to_string()),
@@ -368,6 +369,8 @@ pub struct Pool {
     policy: Mutex<PolicyState>,
     /// the Stratum V2 port and authority key, for the API (set at start when SV2 is on)
     pub sv2_info: RwLock<Value>,
+    /// the readers' current addresses (SOLO45_WEB_READERS: IPs as given, names looked up every minute)
+    pub readers: RwLock<Vec<std::net::Ipv4Addr>>,
     pub started: f64,
 }
 
@@ -399,6 +402,7 @@ impl Pool {
             guard: Mutex::new(StallGuard::new(events)),
             policy: Mutex::new(pstate),
             sv2_info: RwLock::new(Value::Null),
+            readers: RwLock::new(Vec::new()), // filled by resolve_readers
             rpc,
             jobs: RwLock::new(VecDeque::new()),
             current: RwLock::new(None),
@@ -1010,6 +1014,36 @@ impl Pool {
         });
     }
 
+    /// Every minute: look up the readers given by name (another app's container, which has no fixed IP on umbrelOS
+    /// and may get a new one after a restart). Addresses given as IPs stay as they are.
+    async fn resolve_readers(self: Arc<Self>) {
+        let mut last: Vec<std::net::Ipv4Addr> = Vec::new();
+        loop {
+            let mut now: Vec<std::net::Ipv4Addr> = Vec::new();
+            for r in &self.cfg.web_readers {
+                if let Ok(ip) = r.parse::<std::net::Ipv4Addr>() {
+                    now.push(ip);
+                    continue;
+                }
+                match tokio::net::lookup_host(format!("{}:0", r)).await {
+                    Ok(addrs) => now.extend(addrs.filter_map(|a| match a.ip() {
+                        std::net::IpAddr::V4(v) => Some(v),
+                        _ => None,
+                    })),
+                    Err(_) => {} // not running right now: nothing to let in
+                }
+            }
+            now.sort();
+            now.dedup();
+            if now != last {
+                log!("INFO", "status page readers ({}): {}", self.cfg.web_readers.join(", "),
+                     if now.is_empty() { "none found".to_string() } else { now.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ") });
+                *self.readers.write().unwrap() = now.clone();
+                last = now;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
     /// At start: a block saved as "sending" whose answer never came (Core stopped while sending it, or gave up while
     /// the node was down) goes to the node again if it can still count: it is for the next block, or the node's
     /// newest block (it may already have it: then "duplicate" = it got there). Older ones are recorded as stale, so
@@ -1372,6 +1406,9 @@ impl Pool {
         tokio::spawn(self.clone().longpoll_blocks());
         tokio::spawn(self.clone().refresh_templates());
         tokio::spawn(self.clone().resume_unsent()); // a found block Core stopped sending, if any
+        if !self.cfg.web_readers.is_empty() {
+            tokio::spawn(self.clone().resolve_readers()); // IPs as given, names looked up every minute
+        }
         self.load_history();
         tokio::spawn(self.clone().housekeeping());
         tokio::spawn(self.clone().stall_guard_loop());

@@ -184,6 +184,9 @@ enum Sub {
     Std(SubmitSharesStandardOwned),
 }
 
+/// Shares the reference vardiff needs before it may change a channel's difficulty (see Conn::vardiff).
+const VARDIFF_MIN_SHARES: u32 = 12;
+
 /// One channel on a connection: the reference channel state plus the miner as the pool shows it.
 struct Chan {
     ch: Ch,
@@ -679,10 +682,22 @@ impl Conn {
         Ok(())
     }
 
-    async fn vardiff(&mut self) -> Result<()> {        let mut out = Vec::new();
+    async fn vardiff(&mut self) -> Result<()> {
+        let mut out = Vec::new();
+        let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         for (id, c) in self.chans.iter_mut() {
             if c.fixed {
                 continue; // a fixed difficulty from the API
+            }
+            // the reference vardiff judges every minute; at one share per ~10 s a single quiet minute (0 shares,
+            // about 1 minute in 400) divides the difficulty by 3 and the next ones overshoot. Let it judge only once
+            // there are VARDIFF_MIN_SHARES shares to go on, after 5 minutes, or after 2 minutes with no share at all (a
+            // difficulty far too hard: by chance that's about 1 in 160,000 at one share per 10 s, so it steps down
+            // every 2 minutes instead of every 5). A flood of shares is handled at once by early_retarget.
+            let since = now_s.saturating_sub(c.vardiff.timestamp_of_last_update);
+            let shares = c.vardiff.shares_since_last_update;
+            if shares < VARDIFF_MIN_SHARES && since < 300 && !(shares == 0 && since >= 120) {
+                continue;
             }
             let (h, t, spm) = on!(&c.ch, x => (x.get_nominal_hashrate(), *x.get_target(), x.get_shares_per_minute()));
             let Ok(Some(new_h)) = c.vardiff.try_vardiff(h, &t, spm) else {

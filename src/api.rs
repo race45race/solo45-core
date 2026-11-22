@@ -78,7 +78,7 @@ fn default_gateway() -> Option<Ipv4Addr> {
 /// changes through the Umbrel login. Never pool settings, the payout address, the policy, backups or restores.
 fn is_reader(pool: &Pool, ip: IpAddr) -> bool {
     let Some(ip) = v4(ip) else { return false };
-    pool.cfg.web_readers.iter().any(|r| *r == ip)
+    pool.readers.read().unwrap().iter().any(|r| *r == ip)
 }
 
 fn v4(ip: IpAddr) -> Option<Ipv4Addr> {
