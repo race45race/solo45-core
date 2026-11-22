@@ -195,6 +195,12 @@ struct Chan {
     spk: Vec<u8>,
     tip: String, // the block this channel's jobs build on (prev hash, display hex)
     fixed: bool, // a fixed difficulty set for this miner (API override): no vardiff
+    /// the difficulty each job went out at: a share counts at its job's difficulty, never more (V1's job_diff), so
+    /// shares a miner still sends on older jobs after a difficulty rise don't count at the new one
+    job_diff: HashMap<u32, f64>,
+    /// a new channel's first shares (when, count, work): if they flood in, the difficulty goes up at once instead of
+    /// waiting for the next minute's vardiff (Braiins OS reports a tiny hashrate when it connects)
+    early: (f64, u32, f64),
 }
 
 struct Conn {
@@ -404,6 +410,10 @@ impl Conn {
         // start at the fixed difficulty, or where this miner left off (like V1's remembered difficulty), instead of the
         // miner's own guess: a difficulty is a hashrate at this channel's share rate, which the channel turns into a target
         let start = fixed_diff.or_else(|| self.pool.remembered_diff(&name));
+        // a miner new to this pool: its own hashrate guess, but never under the V1 port's start difficulty
+        let floor = self.pool.cfg.start_diff;
+        let guess = on!(&ch, x => x.get_target().difficulty_float());
+        let start = start.or(if guess < floor { Some(floor) } else { None });
         if let Some(d) = start {
             let h = (d * 4_294_967_296.0 * spm as f64 / 60.0) as f32;
             if on!(&mut ch, x => x.update_channel(h, None).is_err()) {
@@ -451,7 +461,8 @@ impl Conn {
                 self.pool.workers.lock().unwrap().insert(worker_id, WorkerHandle { info: info.clone(), ctl: ctl_tx });
                 let vardiff = VardiffState::new().map_err(|e| anyhow!("vardiff: {:?}", e))?;
                 self.chans.insert(channel_id, Chan { ch, vardiff, worker_id, info, name: name.clone(), address: address.clone(), spk,
-                                                     tip: String::new(), fixed: fixed_diff.is_some() });
+                                                     tip: String::new(), fixed: fixed_diff.is_some(), job_diff: HashMap::new(),
+                                                     early: (now_f(), 0, 0.0) });
                 log!("INFO", "authorized {} {} ({}, Stratum V2 {} channel {}) pays {}, difficulty {}{}", self.ip, name, self.agent, kind,
                      channel_id, address, fmt_diff(diff), if fixed_diff.is_some() { " (fixed)" } else if start.is_some() { " (remembered)" } else { "" });
         }
@@ -504,6 +515,23 @@ impl Conn {
                 Ch::Std(x) => MiningOwned::NewMiningJob(x.get_active_job().ok_or_else(|| anyhow!("no active job"))?.get_job_message().clone()),
             });
         }
+        let c = self.chans.get_mut(&channel_id).expect("channel");
+        let d = on!(&c.ch, x => x.get_target().difficulty_float());
+        for m in &out {
+            let id = match m {
+                MiningOwned::NewExtendedMiningJob(j) => j.job_id,
+                MiningOwned::NewMiningJob(j) => j.job_id,
+                _ => continue,
+            };
+            if new_block {
+                c.job_diff.clear(); // older jobs are stale now
+            }
+            c.job_diff.insert(id, d);
+        }
+        if c.job_diff.len() > 200 {
+            let keep: Vec<u32> = { let mut k: Vec<u32> = c.job_diff.keys().copied().collect(); k.sort_unstable(); k.split_off(k.len() - 100) };
+            c.job_diff.retain(|k, _| keep.contains(k));
+        }
         for m in out {
             self.send_mining(m).await?;
         }
@@ -521,7 +549,8 @@ impl Conn {
             return self.send_mining(MiningOwned::SubmitSharesError(bad_channel)).await;
         };
         c.vardiff.increment_shares_since_last_update();
-        let credit = on!(&c.ch, x => x.get_target().difficulty_float());
+        let now_diff = on!(&c.ch, x => x.get_target().difficulty_float());
+        let credit = c.job_diff.get(&job_id).map_or(now_diff, |d| d.min(now_diff));
         let res = match (&mut c.ch, sub) {
             (Ch::Ext(x), Sub::Ext(s)) => x.validate_share(s),
             (Ch::Std(x), Sub::Std(s)) => x.validate_share(s),
@@ -538,7 +567,8 @@ impl Conn {
                 let share_diff = hash_diff(hash.as_ref());
                 self.credit(channel_id, credit, share_diff, now, false);
                 let m = ok(&self.chans[&channel_id]);
-                self.send_mining(MiningOwned::SubmitSharesSuccess(m)).await
+                self.send_mining(MiningOwned::SubmitSharesSuccess(m)).await?;
+                self.early_retarget(channel_id, credit, now).await
             }
             Ok(ShareValidationResult::BlockFound(hash, template_id, coinbase)) => {
                 let share_diff = hash_diff(hash.as_ref());
@@ -623,8 +653,32 @@ impl Conn {
         self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id, target: t.to_le_bytes().into() })).await
     }
 
-    async fn vardiff(&mut self) -> Result<()> {
-        let mut out = Vec::new();
+    /// A new channel's first minutes: after 20 shares, if they came in at least 4x faster than this channel's share
+    /// rate, set the difficulty from the measured rate right away (the minute vardiff would otherwise let a miner that
+    /// guessed its hashrate far too low flood the pool, and the reference share-budget check drops it).
+    async fn early_retarget(&mut self, channel_id: u32, credit: f64, now: f64) -> Result<()> {
+        let Some(c) = self.chans.get_mut(&channel_id) else { return Ok(()) };
+        if c.fixed || now - c.early.0 > 120.0 {
+            return Ok(());
+        }
+        c.early.1 += 1;
+        c.early.2 += credit;
+        if c.early.1 < 20 {
+            return Ok(());
+        }
+        let spm = on!(&c.ch, x => x.get_shares_per_minute()) as f64;
+        let rate = c.early.2 * 4_294_967_296.0 / (now - c.early.0).max(1.0); // hashes per second
+        let want = rate * 60.0 / spm.max(0.1) / 4_294_967_296.0;
+        let cur = on!(&c.ch, x => x.get_target().difficulty_float());
+        c.early = (now, 0, 0.0);
+        if want > cur * 4.0 {
+            log!("INFO", "{} (Stratum V2): shares came in {:.0}x too fast, difficulty {} -> {}", c.name, want / cur, fmt_diff(cur), fmt_diff(want));
+            return self.set_difficulty(channel_id, want).await;
+        }
+        Ok(())
+    }
+
+    async fn vardiff(&mut self) -> Result<()> {        let mut out = Vec::new();
         for (id, c) in self.chans.iter_mut() {
             if c.fixed {
                 continue; // a fixed difficulty from the API
@@ -688,7 +742,9 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
         endpoint_host: s("")?, endpoint_port: 0, vendor: s("solo45-test")?, hardware_version: s("cpu")?,
         firmware: s("solo45-core-test")?, device_id: s("1")? };
     w.write_frame(send(AnyMessageOwned::Common(setup.into()))?).await.map_err(|e| anyhow!("{:?}", e))?;
-    let open = OpenStandardMiningChannelOwned { request_id: 7u32.into(), user_identity: s(user)?, nominal_hash_rate: 1e5,
+    // SOLO45_TEST_NOMINAL: the hashrate it claims (default 1e5 H/s); a tiny one acts like Braiins OS at connect
+    let nominal: f32 = std::env::var("SOLO45_TEST_NOMINAL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e5);
+    let open = OpenStandardMiningChannelOwned { request_id: 7u32.into(), user_identity: s(user)?, nominal_hash_rate: nominal,
                                                 max_target: [0xffu8; 32].into() };
     let mut opened = false;
     let (mut channel, mut target, mut job): (u32, [u8; 32], Option<(u32, u32, [u8; 32])>) = (0, [0xff; 32], None);
@@ -783,7 +839,19 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
                         nonce_base = n.wrapping_add(1);
                         seq += 1;
                         sent += 1;
-                        job = None; // on regtest that share was a block: wait for the next block's work
+                        // a block (every share on regtest): wait for the next block's work; otherwise keep mining this job
+                        let exp = (nbits >> 24) as usize;
+                        let mut net = [0u8; 32]; // the network target, big-endian
+                        for (i, b) in (nbits & 0x00ff_ffff).to_be_bytes()[1..].iter().enumerate() {
+                            if let Some(p) = (32 + i).checked_sub(exp) {
+                                if p < 32 {
+                                    net[p] = *b;
+                                }
+                            }
+                        }
+                        if d <= net {
+                            job = None;
+                        }
                         break;
                     }
                 }
