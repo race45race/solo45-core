@@ -446,6 +446,7 @@ impl Conn {
                 info.address = address.clone();
                 info.spk = spk.clone();
                 info.diff = diff;
+                info.protocol = if extended { "SV2 extended" } else { "SV2 standard" };
                 let info = Arc::new(Mutex::new(info));
                 let worker_id = self.pool.next_worker_id();
                 // difficulty changes from the API reach this connection tagged with the channel

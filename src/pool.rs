@@ -129,6 +129,8 @@ pub struct WorkerInfo {
     pub last_height: Option<u64>,
     pub connected: f64,
     pub shares: VecDeque<(f64, f64)>,
+    /// "V1", "SV2 extended" or "SV2 standard"
+    pub protocol: &'static str,
 }
 
 impl WorkerInfo {
@@ -136,7 +138,7 @@ impl WorkerInfo {
         WorkerInfo {
             name: String::new(), ip: ip.to_string(), agent: String::new(), user: String::new(), address: String::new(),
             spk: Vec::new(), diff: 0.0, switches_at_once: false, accepted: 0, rejected: BTreeMap::new(), best: 0.0,
-            last_share: 0.0, last_height: None, connected: now, shares: VecDeque::new(),
+            last_share: 0.0, last_height: None, connected: now, shares: VecDeque::new(), protocol: "V1",
         }
     }
 }
@@ -195,6 +197,8 @@ pub struct Upd {
     pub clean: bool,
     /// see NewJob::flush
     pub flush: bool,
+    /// have the node check this job now, not at the next routine check (a policy or payout change: a new kind of job)
+    pub check: bool,
     /// a template the node already built (the long-poll's reply)
     pub tpl: Option<Value>,
     /// the block that prompted this; nothing to do if another path already made its job
@@ -705,7 +709,7 @@ impl Pool {
             // the node fully checks every new block's work; routine refreshes less often
             let due = {
                 let mut s = self.stats.lock().unwrap();
-                let due = new_block || filled || now_f() - s.last_proposal >= check_every_s(&s);
+                let due = new_block || filled || u.check || now_f() - s.last_proposal >= check_every_s(&s);
                 if due {
                     s.last_proposal = now_f();
                 }
@@ -901,7 +905,7 @@ impl Pool {
             self.policy.lock().unwrap().fallback_height = Some(job.height);
             let me = self.clone();
             tokio::spawn(async move {
-                let _ = me.update_template(Upd { clean: true, flush: true, ..Default::default() }).await;
+                let _ = me.update_template(Upd { clean: true, flush: true, check: true, ..Default::default() }).await;
             });
         } else if job.empty {
             log!("ERROR", "the empty template for block {} failed the block check; ending the hold", job.height);
@@ -1394,6 +1398,7 @@ impl Pool {
                     "name": i.name, "ip": i.ip, "agent": i.agent, "address": i.address, "diff": i.diff,
                     "switches_at_once": i.switches_at_once, "accepted": i.accepted, "rejected": i.rejected,
                     "best": i.best, "last_share": i.last_share, "last_height": i.last_height, "connected": i.connected,
+                    "protocol": i.protocol,
                     "hashrate_5m": hashrate(i.shares.iter(), 300f64.min(since), now),
                     "hashrate_1h": hashrate(i.shares.iter(), 3600f64.min(since), now),
                 })
@@ -1635,7 +1640,7 @@ impl Pool {
              list("filter"), list("watch"));
         let me = self.clone();
         tokio::spawn(async move {
-            let _ = me.update_template(Upd::default()).await; // apply it to the next job right away
+            let _ = me.update_template(Upd { check: true, ..Default::default() }).await; // apply it to the next job right away, checked
         });
         let mut v = self.policy_view();
         v["ok"] = json!(true);
@@ -1725,7 +1730,7 @@ impl Pool {
             log!("INFO", "{} miner{} now pay a different address", changed, if changed == 1 { "" } else { "s" });
             let me = self.clone();
             tokio::spawn(async move {
-                let _ = me.update_template(Upd { clean: true, ..Default::default() }).await;
+                let _ = me.update_template(Upd { clean: true, check: true, ..Default::default() }).await;
             });
         }
     }
@@ -1751,7 +1756,7 @@ impl Pool {
         log!("INFO", "payout address set to {}", address);
         let me = self.clone();
         tokio::spawn(async move {
-            let _ = me.update_template(Upd { clean: true, ..Default::default() }).await;
+            let _ = me.update_template(Upd { clean: true, check: true, ..Default::default() }).await;
         });
         (200, json!({"ok": true, "address": address}))
     }

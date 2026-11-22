@@ -75,8 +75,8 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 
   <h2>Miners</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Miner</th><th>Hashrate 1 h</th><th>5 min</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th>Best (since it connected)</th><th>Best ever</th><th>Last share</th></tr></thead>
-    <tbody id="workers"><tr><td colspan="9" class="dim">No miners yet.</td></tr></tbody>
+    <thead><tr><th>Miner</th><th>Protocol</th><th>Hashrate 1 h</th><th>5 min</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th>Best (since it connected)</th><th>Best ever</th><th>Last share</th></tr></thead>
+    <tbody id="workers"><tr><td colspan="10" class="dim">No miners yet.</td></tr></tbody>
   </table></div>
 
   <h2>Live shares</h2>
@@ -244,10 +244,11 @@ function render(d) {
   $("workers").innerHTML = ws.length ? ws.map(w => {
     const r = sum(w.rejected), stale = now - (w.last_share || 0) > 300;
     return `<tr><td><b>${esc(w.name)}</b> <span class="dim">${SHOT ? "" : esc(w.ip)}</span></td>` +
+      `<td title="${w.protocol && w.protocol.startsWith("SV2") ? "Stratum V2: encrypted, checked against this pool's key" : "Stratum V1"}">${esc(w.protocol || "V1")}</td>` +
       `<td>${esc(hs(w.hashrate_1h))}</td><td>${esc(hs(w.hashrate_5m))}</td><td>${esc(si(w.diff))}</td>` +
       `<td>${esc((w.accepted || 0).toLocaleString())}</td><td class="${r ? "warn" : ""}">${esc(r)}</td>` +
       `<td>${esc(si(w.best))}</td><td>${esc(si(w.best_ever || w.best))}</td><td class="${stale ? "bad" : ""}">${esc(ago(w.last_share, now))}</td></tr>`;
-  }).join("") : `<tr><td colspan="9" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
+  }).join("") : `<tr><td colspan="10" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
   const blocks = (p.blocks || []).slice().reverse();
   $("blockwrap").hidden = !blocks.length;
   $("blocks").innerHTML = blocks.map(b => `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(b.worker)}</td>` +
