@@ -294,15 +294,15 @@ impl Conn {
                     self.handle(msg).await?;
                 }
                 j = jobs.recv() => {
-                    let job = match j {
-                        Ok(NewJob { job, .. }) => job,
-                        Err(broadcast::error::RecvError::Lagged(_)) => match self.pool.current() { Some(j) => j, None => continue },
+                    let (job, flush) = match j {
+                        Ok(NewJob { job, flush, .. }) => (job, flush),
+                        Err(broadcast::error::RecvError::Lagged(_)) => match self.pool.current() { Some(j) => (j, false), None => continue },
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     };
                     let ids: Vec<u32> = self.chans.keys().copied().collect();
                     let new_block = self.chans.values().any(|c| c.tip != job.prev_hex);
                     for id in &ids {
-                        self.push_job(*id, &job).await?;
+                        self.push_job(*id, &job, flush).await?;
                     }
                     if new_block && !ids.is_empty() {
                         // the new block's work is out on every SV2 channel of this connection
@@ -456,17 +456,30 @@ impl Conn {
                      channel_id, address, fmt_diff(diff), if fixed_diff.is_some() { " (fixed)" } else if start.is_some() { " (remembered)" } else { "" });
         }
         if let Some(job) = self.pool.current() {
-            self.push_job(channel_id, &job).await?;
+            self.push_job(channel_id, &job, false).await?;
         }
         Ok(())
     }
 
     /// Give one channel a Core job: a new block's job as a future template plus SetNewPrevHash, otherwise as an
-    /// immediate job for the block it is already on.
-    async fn push_job(&mut self, channel_id: u32, job: &Arc<Job>) -> Result<()> {
+    /// immediate job for the block it is already on. When the earlier work must not be used any more (`flush`: the
+    /// node refused that job) or the miner's payout changed, the job goes out like a new block's, with SetNewPrevHash
+    /// for the same block: the miner drops its old jobs, and shares on them are refused as stale (V1's clean_jobs).
+    async fn push_job(&mut self, channel_id: u32, job: &Arc<Job>, flush: bool) -> Result<()> {
         let Some(c) = self.chans.get_mut(&channel_id) else { return Ok(()) };
+        let (spk, address) = {
+            let i = c.info.lock().unwrap();
+            (i.spk.clone(), i.address.clone())
+        };
+        // a new payout address (set on the page, or the default address now enforced) reaches this channel's next job
+        let repay = !spk.is_empty() && spk != c.spk;
+        if repay {
+            log!("INFO", "{} {}: Stratum V2 work now pays {}", self.ip, c.name, address);
+            c.spk = spk;
+            c.address = address;
+        }
         let template_id = u64::from_str_radix(&job.id, 16).unwrap_or(0);
-        let new_block = c.tip != job.prev_hex;
+        let new_block = c.tip != job.prev_hex || flush || repay;
         let template = new_template(job, template_id, new_block)?;
         let outputs = vec![TxOut { value: Amount::from_sat(job.value), script_pubkey: ScriptBuf::from(c.spk.clone()) }];
         on!(&mut c.ch, x => x.on_new_template(template, outputs).map_err(|e| anyhow!("job for channel {}: {:?}", channel_id, e)))?;
@@ -650,6 +663,25 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
     let stream = TcpStream::connect(addr).await?;
     let noise = NoiseTcpStream::connect(stream, init, HANDSHAKE_TIMEOUT).await.map_err(|e| anyhow!("handshake: {:?}", e))?;
     let (mut r, mut w) = noise.into_split();
+    // frames are read in their own task (read_frame is not cancel-safe), so the miner keeps taking new work while it
+    // pauses between shares, like a real miner
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Result<AnyMessageOwned>>();
+    tokio::spawn(async move {
+        loop {
+            let res = match r.read_frame().await {
+                Ok(mut f) => {
+                    let header = f.header();
+                    parse_message_frame_with_tlvs(header, f.payload(), &[]).map(|x| x.0.into_owned()).map_err(|e| anyhow!("{:?}", e))
+                }
+                Err(e) => Err(anyhow!("{:?}", e)),
+            };
+            let stop = res.is_err();
+            if msg_tx.send(res).is_err() || stop {
+                break;
+            }
+        }
+    });
+    let mut resume_at: Option<tokio::time::Instant> = None;
     let send = |m: AnyMessageOwned| -> Result<OutboundFrame> { OutboundFrame::from_message(m).map_err(|e| anyhow!("{:?}", e)) };
     let s = |t: &str| -> Result<_> { t.to_string().try_into().map_err(|e| anyhow!("{:?}", e)) };
     let setup = SetupConnectionOwned { protocol: Protocol::MiningProtocol, min_version: 2, max_version: 2, flags: 0,
@@ -665,10 +697,14 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
     let (mut sent, mut seq) = (0u32, 0u32);
     let mut nonce_base = 0u32;
     loop {
-        let mut f = tokio::time::timeout(Duration::from_secs(30), r.read_frame()).await
-            .map_err(|_| anyhow!("no message for 30 s"))?.map_err(|e| anyhow!("{:?}", e))?;
-        let header = f.header();
-        let msg = parse_message_frame_with_tlvs(header, f.payload(), &[]).map_err(|e| anyhow!("{:?}", e))?.0.into_owned();
+        let wait = resume_at.map_or(Duration::from_secs(30), |t| t.saturating_duration_since(tokio::time::Instant::now()));
+        let msg = match tokio::time::timeout(wait, msg_rx.recv()).await {
+            Ok(Some(m)) => Some(m?),
+            Ok(None) => return Err(anyhow!("connection closed")),
+            Err(_) if resume_at.is_some() => None, // the pause is over: mine the next share
+            Err(_) => return Err(anyhow!("no message for 30 s")),
+        };
+        if let Some(msg) = msg {
         match msg {
             AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(m)) => {
                 println!("SetupConnectionSuccess version {} flags {:#x}", m.used_version, m.flags);
@@ -691,6 +727,7 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
                 }
             }
             AnyMessageOwned::Mining(MiningOwned::SetNewPrevHash(m)) => {
+                println!("SetNewPrevHash job {} prev {}", m.job_id, hex::encode(m.prev_hash.to_array()));
                 prev = Some(m.prev_hash.to_array());
                 ntime = m.ntime_start;
                 nbits = m.nbits;
@@ -710,11 +747,20 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
             }
             _ => {}
         }
+        }
         // mine one share on the current job, then wait for the answer (and new work, on regtest)
         if let (true, Some((job_id, version, root)), Some(p)) = (opened, job, prev) {
             if sent < shares && seq == sent {
                 if pause_s > 0.0 && sent > 0 {
-                    tokio::time::sleep(Duration::from_secs_f64(pause_s)).await; // load tests: one share every pause_s
+                    // load tests: one share every pause_s, still taking new work meanwhile
+                    match resume_at {
+                        None => {
+                            resume_at = Some(tokio::time::Instant::now() + Duration::from_secs_f64(pause_s));
+                            continue;
+                        }
+                        Some(t) if tokio::time::Instant::now() < t => continue,
+                        _ => resume_at = None,
+                    }
                 }
                 let mut hdr = Vec::with_capacity(80);
                 hdr.extend(version.to_le_bytes());

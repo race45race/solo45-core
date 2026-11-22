@@ -47,6 +47,8 @@ jobs:
           python3 tools/test_sv2.py
       - name: Stratum V2 standard channels
         run: bash tools/test_sv2_standard.sh
+      - name: Stratum V2 work replaced at once (payout change; same path as a job the node refuses)
+        run: bash tools/test_sv2_repay.sh
       - name: Logs
         if: always()
         run: |

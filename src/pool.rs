@@ -107,6 +107,9 @@ impl Config {
 pub struct NewJob {
     pub job: Arc<Job>,
     pub clean: bool,
+    /// the miners' earlier work for this block must not be used any more (the node refused that job): Stratum V2
+    /// channels then get the new job the way a new block's work goes out, so older jobs go stale at once
+    pub flush: bool,
 }
 
 /// What a connected miner shows on the API (shared between its connection task and the pool).
@@ -190,6 +193,8 @@ pub struct TplState {
 #[derive(Default)]
 pub struct Upd {
     pub clean: bool,
+    /// see NewJob::flush
+    pub flush: bool,
     /// a template the node already built (the long-poll's reply)
     pub tpl: Option<Value>,
     /// the block that prompted this; nothing to do if another path already made its job
@@ -675,7 +680,7 @@ impl Pool {
                 drop(filtered_tpl);
                 self.install(&j);
                 let workers = self.worker_count();
-                let _ = self.job_tx.send(NewJob { job: j.clone(), clean: clean || new_block });
+                let _ = self.job_tx.send(NewJob { job: j.clone(), clean: clean || new_block, flush: u.flush });
                 let ms = t0.elapsed().as_millis() as u64;
                 if new_block {
                     self.note_switch(&j, ms, workers);
@@ -736,7 +741,7 @@ impl Pool {
         st.held_at = 0.0;
         self.install(&j);
         let workers = self.worker_count();
-        let _ = self.job_tx.send(NewJob { job: j.clone(), clean: true });
+        let _ = self.job_tx.send(NewJob { job: j.clone(), clean: true, flush: false });
         let ms = t0.elapsed().as_millis() as u64;
         self.note_switch(&j, ms, workers);
         log!("INFO", "new network block {} ({}), now mining {} (spotted by the {})", j.height - 1, j.prev_hex, j.height, source);
@@ -896,7 +901,7 @@ impl Pool {
             self.policy.lock().unwrap().fallback_height = Some(job.height);
             let me = self.clone();
             tokio::spawn(async move {
-                let _ = me.update_template(Upd { clean: true, ..Default::default() }).await;
+                let _ = me.update_template(Upd { clean: true, flush: true, ..Default::default() }).await;
             });
         } else if job.empty {
             log!("ERROR", "the empty template for block {} failed the block check; ending the hold", job.height);
@@ -1250,6 +1255,31 @@ impl Pool {
     }
 
     // ------------------------------------------------------------------ start and stop
+
+    /// Before starting: wait while the node can't be reached or is still loading (after a reboot both apps start at
+    /// once, and the node takes a while). A WARNING when it starts waiting and every 5 minutes, an ERROR only once
+    /// it has waited 15 minutes. Returns how long it waited.
+    pub async fn wait_for_node(&self) -> f64 {
+        let t0 = Instant::now();
+        let mut said = -1.0f64;
+        loop {
+            let err = match self.rpc.call_t("getblockchaininfo", json!([]), 10).await {
+                Ok(_) => return t0.elapsed().as_secs_f64(),
+                Err(e) => format!("{:#}", e),
+            };
+            let waited = t0.elapsed().as_secs_f64();
+            if said < 0.0 || waited - said >= 300.0 {
+                said = waited;
+                let why = if err.contains("\"code\":-28") { "the node is still starting".to_string() } else { err.chars().take(120).collect() };
+                if waited >= 900.0 {
+                    log!("ERROR", "still waiting for the node after {} min: {}", (waited / 60.0).round(), why);
+                } else {
+                    log!("WARNING", "waiting for the node: {}", why);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         if let Some(saved) = self.setting("default_address").and_then(|v| v.as_str().map(String::from)) {

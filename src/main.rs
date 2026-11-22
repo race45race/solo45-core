@@ -53,6 +53,10 @@ async fn serve() -> Result<()> {
             return Err(e);
         }
     };
+    let waited = pool.wait_for_node().await;
+    if waited >= 2.0 {
+        log!("INFO", "the node is ready (waited {:.0} s)", waited);
+    }
     if let Err(e) = pool.start().await {
         log!("ERROR", "can't start: {:#} (the app restarts and tries again)", e);
         return Err(e);
