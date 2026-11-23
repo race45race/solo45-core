@@ -48,7 +48,9 @@ user_identity = "$ADDR.sv2proxy"
 CONF
 setsid nohup $TP -c $T/tproxy.toml > $T/tproxy.out 2>&1 < /dev/null &
 echo $! > $T/tproxy.pid
-sleep 3
+# wait until tProxy listens for miners (a slow CI runner can need more than a few seconds), up to 30 s
+for i in $(seq 1 60); do ss -ltn 2>/dev/null | grep -q '127.0.0.1:34261 ' && break; sleep 0.5; done
+sleep 1
 echo "core: $(grep -c . $T/pool.log) log lines; authority $PUB"
 grep -a 'Stratum V2\|authorized' $T/pool.log | tail -n 3 | cut -c1-200
 tail -n 5 $T/tproxy.out | cut -c1-200

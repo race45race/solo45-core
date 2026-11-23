@@ -73,14 +73,21 @@ def main():
     check("Core reports its Stratum V2 port and authority key", (s["pool"].get("sv2") or {}).get("port") == 34260
           and len((s["pool"]["sv2"] or {}).get("authority_pubkey", "")) > 40, s["pool"].get("sv2"))
 
-    c = tm.Client()
+    for i in range(30):  # tProxy may still be starting on a slow CI runner
+        try:
+            c = tm.Client()
+            break
+        except OSError:
+            time.sleep(1)
+    else:
+        c = tm.Client()
     sub = c.call("mining.subscribe", ["sv2-test/1.0"])["result"]
     en1 = bytes.fromhex(sub[1])
     check("tProxy hands out extranonce2 of 8 bytes", sub[2] == 8, sub[1:])
     USER = addr + ".sv2miner"
     r = c.call("mining.authorize", [USER, "x"])
     check("authorize through tProxy", r.get("result") is True, r)
-    job = c.job or (c.wait_note("mining.notify", 10) and c.job)
+    job = c.job or (c.wait_note("mining.notify", 30) and c.job)  # tProxy opens its SV2 channel first
     check("work arrives through tProxy (from Core over Stratum V2)", job is not None)
     if not job:
         return finish()
