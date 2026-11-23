@@ -144,6 +144,45 @@ pub fn from_cgminer(temps: &Value, fans: &Value, tuner: &Value) -> Value {
     })
 }
 
+/// Canaan packs an Avalon's readings into one "estats" string: 'TAvg[71] OTemp[52] FanR[40%] MPO[133] ...'.
+pub fn avalon_fields(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while let Some(open) = text[i..].find('[').map(|p| p + i) {
+        let mut k = open;
+        while k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_') {
+            k -= 1;
+        }
+        let Some(close) = text[open..].find(']').map(|p| p + open) else { break };
+        if k < open {
+            out.insert(text[k..open].to_string(), text[open + 1..close].to_string());
+        }
+        i = close + 1;
+    }
+    out
+}
+
+/// An Avalon's estats ("MM ID0" string) -> the readings shown on the page (the same fields the Solo45 dashboard uses).
+pub fn from_avalon(mm: &str) -> Value {
+    let f = avalon_fields(mm);
+    let n = |k: &str, idx: isize| -> Option<f64> {
+        let parts: Vec<&str> = f.get(k)?.split_whitespace().collect();
+        let i = if idx < 0 { parts.len().checked_sub(1)? } else { idx as usize };
+        parts.get(i)?.trim_end_matches('%').parse::<f64>().ok().filter(|x| x.is_finite())
+    };
+    let watts = n("MPO", 0).filter(|w| *w > 0.0).or_else(|| n("PS", -1).filter(|w| *w > 0.0));
+    json!({
+        "kind": "avalon",
+        "model": "Avalon",
+        "temp": n("TAvg", 0).filter(|t| *t > -40.0 && *t < 150.0),
+        "temp_max": n("TMax", 0),
+        "vr_temp": n("OTemp", 0).filter(|t| *t > -40.0 && *t < 150.0),
+        "fan": n("FanR", 0),
+        "watts": watts,
+    })
+}
+
 async fn read_device(ip: &str, kind: Option<&str>) -> Option<Value> {
     if kind != Some("braiins") {
         if let Some(i) = http_json(ip, "/api/system/info").await {
@@ -161,6 +200,19 @@ async fn read_device(ip: &str, kind: Option<&str>) -> Option<Value> {
             // other CGMiner-API miners (an Avalon Nano, say) answer but report none of these: show nothing
             if ["temp", "fan", "watts"].iter().any(|k| !d[*k].is_null()) {
                 return Some(d);
+            }
+        }
+        // a Canaan Avalon (Nano 3S): its readings are only in the estats string
+        if let Some(st) = cgminer(ip, "estats").await {
+            let mm = st["STATS"].as_array().into_iter().flatten()
+                .flat_map(|s| s.as_object().into_iter().flatten())
+                .find(|(k, v)| k.starts_with("MM ID") && v.is_string())
+                .and_then(|(_, v)| v.as_str().map(String::from));
+            if let Some(mm) = mm {
+                let d = from_avalon(&mm);
+                if ["temp", "fan", "watts"].iter().any(|k| !d[*k].is_null()) {
+                    return Some(d);
+                }
             }
         }
     }
@@ -255,5 +307,18 @@ mod tests {
         assert_eq!(d["fan"], 45.0);
         assert_eq!(d["watts"], 2142.0);
         assert!(!private_v4("8.8.8.8") && private_v4("192.168.4.28") && !private_v4("nonsense"));
+    }
+
+    #[test]
+    fn avalon_readings() {
+        let mm = "Ver[Nano3s] OTemp[52] TMax[76] TAvg[71] TarT[90] Fan1[1700] FanR[40%] PS[0 0 27471 4 0 3782 131] MPO[133] WORKMODE[2]";
+        let d = from_avalon(mm);
+        assert_eq!(d["temp"], 71.0);
+        assert_eq!(d["vr_temp"], 52.0);
+        assert_eq!(d["fan"], 40.0);
+        assert_eq!(d["watts"], 133.0);
+        let no_mpo = from_avalon("TAvg[60] PS[0 0 27471 4 0 3782 131]");
+        assert_eq!(no_mpo["watts"], 131.0);
+        assert!(from_avalon("garbage [ no ] fields")["temp"].is_null());
     }
 }

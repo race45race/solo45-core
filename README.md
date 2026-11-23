@@ -35,7 +35,7 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   mainnet templates. `solo45-core sv2-miner <host:port> <authority key> <user> <shares>` is a small CPU test miner
   for standard channels.
 - **Status page:** hashrate over 24 hours, live shares, each miner's best share ever, each miner's temperature, fan
-  and watts (read every 30 s from Bitaxes over AxeOS and from Braiins OS miners over port 4028; read only, no logins), the pool settings (job updates, always pay my address, empty block first, electricity price and power cost a day), each miner's share difficulty (automatic, seconds per share or fixed), a 24-hour chart per miner, the last 30 new blocks (work to V1 and SV2 miners, full template, node's check), block switch times (V1 and
+  and watts (read every 30 s from Bitaxes over AxeOS and from Braiins OS and Canaan Avalon miners over port 4028; read only, no logins), the pool settings (job updates, always pay my address, empty block first, electricity price and power cost a day), each miner's share difficulty (automatic, seconds per share or fixed), a 24-hour chart per miner, the last 30 new blocks (work to V1 and SV2 miners, full template, node's check), block switch times (V1 and
   SV2), the node's block check, settings and backup/restore. `?screenshot` hides the payout address and miner IPs.
 - **Small and fast.** One binary. Load test (tools/load_test.py) with 100 Stratum V1 and 20 Stratum V2 miners on
   mainnet templates for 12 minutes: 7,469 shares, 0.7% of one CPU core, 33-76 MB of memory, a new block's work to

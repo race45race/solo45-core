@@ -83,7 +83,7 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 
   <h2>Miners</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Miner</th><th>Protocol</th><th>Hashrate 1 h</th><th>5 min</th><th title="Read from the miner itself every 30 s: chip temperature / voltage regulator (Bitaxe) or board (Braiins OS)">Temp</th><th>Fan</th><th>Power</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th title="Best share since it connected">Best now</th><th>Best ever</th><th>Last share</th></tr></thead>
+    <thead><tr><th>Miner</th><th>Protocol</th><th>Hashrate 1 h</th><th>5 min</th><th title="Read from the miner itself every 30 s: chip temperature / voltage regulator (Bitaxe), board (Braiins OS) or outlet (Avalon)">Temp</th><th>Fan</th><th>Power</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th title="Best share since it connected">Best now</th><th>Best ever</th><th>Last share</th></tr></thead>
     <tbody id="workers"><tr><td colspan="10" class="dim">No miners yet.</td></tr></tbody>
   </table></div>
   <div class="s" style="margin-top:4px">Click a miner for its own 24-hour chart.</div>
@@ -236,7 +236,7 @@ const btc = sat => (sat / 1e8).toFixed(8).replace(/0{1,4}$/, "") + " BTC";
 const sum = o => typeof o === "number" ? o : Object.values(o || {}).reduce((a, b) => a + b, 0);
 // a miner's own readings (devices.rs): temperature, fan and watts, or a dash when it can't be read
 function devCells(d) {
-  if (!d) return `<td class="dim" title="No readings: the miner's API didn't answer (only Bitaxe/AxeOS and Braiins OS are read)">–</td><td class="dim">–</td><td class="dim">–</td>`;
+  if (!d) return `<td class="dim" title="No readings: the miner's API didn't answer (Bitaxe/AxeOS, Braiins OS and Canaan Avalon are read)">–</td><td class="dim">–</td><td class="dim">–</td>`;
   const n = (v, unit, dp) => v == null ? "–" : Number(v).toLocaleString(undefined, {maximumFractionDigits: dp || 0}) + unit;
   const hot = d.kind === "bitaxe" ? (d.temp >= 68 || d.vr_temp >= 85) : d.temp >= 85;
   const tip = [d.model, d.freq ? d.freq + " MHz" : "", d.mv ? d.mv + " mV" : ""].filter(Boolean).join(" · ");
