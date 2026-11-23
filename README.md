@@ -48,7 +48,7 @@ Planned: job declaration, a proxy mode and public stats pages.
 ## Screenshots
 
 The status page, live on the author's Umbrel (screenshot mode: payout address and miner IPs hidden). Three miners
-on Stratum V2 (two Bitaxes on extended channels, an Antminer S19K Pro on Braiins OS on a standard channel), new
+on Stratum V2 (two Bitaxes on extended channels, an Antminer S19K Pro on Braiins OS on a standard channel) with their temperature, fan and watts, new
 block work to every miner in a few milliseconds, 0 rejected shares.
 
 <p align="center"><img src="docs/gallery/1-overview.png" alt="Solo45 SV2 status page" width="78%">
@@ -72,7 +72,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.20
+  ghcr.io/race45race/solo45-core:v0.0.18
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
