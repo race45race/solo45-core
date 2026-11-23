@@ -113,10 +113,13 @@ fn num(v: &Value) -> Option<f64> {
 
 /// AxeOS /api/system/info -> the readings shown on the page.
 pub fn from_axeos(i: &Value) -> Value {
+    // a Bitaxe Hex has two chip sensors (temp, temp2): show the hotter one, like its own page
+    let chip_temp = [num(&i["temp"]), num(&i["temp2"])].into_iter().flatten().filter(|t| *t > 0.0)
+        .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))));
     json!({
         "kind": "bitaxe",
         "model": i["ASICModel"].as_str().map(|m| format!("Bitaxe {}", m)),
-        "temp": num(&i["temp"]),
+        "temp": chip_temp,
         "vr_temp": num(&i["vrTemp"]).filter(|t| *t > 0.0),
         "fan": num(&i["fanspeed"]),
         "watts": num(&i["power"]),
@@ -211,6 +214,10 @@ mod tests {
         assert_eq!(d["model"], "Bitaxe BM1368");
         assert_eq!(d["temp"], 55.5);
         assert_eq!(d["fan"], 40.0);
+        let hex = from_axeos(&json!({"ASICModel": "BM1368", "temp": 24.7, "temp2": 37.4}));
+        assert_eq!(hex["temp"], 37.4);
+        let gamma = from_axeos(&json!({"ASICModel": "BM1370", "temp": 58.0, "temp2": -1}));
+        assert_eq!(gamma["temp"], 58.0);
         let (a, b) = body.split_at(20);
         let chunked = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n", a.len(), a, b.len(), b);
         assert!(http_complete(chunked.as_bytes()));
