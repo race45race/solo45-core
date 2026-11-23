@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "solo45-core"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "anyhow",
  "base64",
