@@ -1,10 +1,11 @@
-<p align="center"><img src="docs/icon.svg" alt="Solo45 Core" width="112"></p>
+<p align="center"><img src="docs/icon.svg" alt="Solo45 SV2" width="112"></p>
 
-# Solo45 Core
+# Solo45 SV2
 
 **A fast solo Bitcoin mining pool in Rust, for your own node.** Test version.
 
-Solo45 Core is the engine behind [Solo45](https://github.com/race45race/solo45), rewritten in Rust. It builds work
+Solo45 SV2 is a separate app from [Solo45](https://github.com/race45race/solo45): the same solo pool rewritten in Rust,
+with Stratum V2 (it was called Solo45 Core until 0.0.18; the repository and image keep that name). It builds work
 from your own Bitcoin node, puts your address in the coinbase and pays any block you find straight to you, with
 no pool fee. It runs next to the Solo45 app, on its own port, so you can move miners over one at a time.
 
@@ -49,16 +50,16 @@ The status page, live on the author's Umbrel (screenshot mode: payout address an
 on Stratum V2 (two Bitaxes on extended channels, an Antminer S19K Pro on Braiins OS on a standard channel), new
 block work to every miner in a few milliseconds, 0 rejected shares.
 
-<p align="center"><img src="docs/gallery/1-overview.png" alt="Solo45 Core status page" width="78%">
-&nbsp;<img src="docs/gallery/3-phone.jpg" alt="Solo45 Core on a phone" width="19%"></p>
+<p align="center"><img src="docs/gallery/1-overview.png" alt="Solo45 SV2 status page" width="78%">
+&nbsp;<img src="docs/gallery/3-phone.jpg" alt="Solo45 SV2 on a phone" width="19%"></p>
 
 [The whole page](docs/gallery/2-full-page.png): live shares, payout, template policy, stall guard.
 
 ## Install on Umbrel
 
 1. Add the community app store `https://github.com/race45race/solo45` in umbrelOS (App Store → ⋯ → Community App
-   Stores) and install **Solo45 Core**. It needs the **Bitcoin Node** app, fully synced.
-2. Open Solo45 Core and enter your **payout address**. Your node checks it before it's saved.
+   Stores) and install **Solo45 SV2**. It needs the **Bitcoin Node** app, fully synced.
+2. Open Solo45 SV2 and enter your **payout address**. Your node checks it before it's saved.
 3. Point a miner at **`stratum+tcp://<your Umbrel's IP>:3346`**. Keep a backup pool set on every miner.
 
 Keep port 3346 on your home network: don't forward it to the internet.
@@ -70,7 +71,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.17
+  ghcr.io/race45race/solo45-core:v0.0.18
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a

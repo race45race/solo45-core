@@ -75,7 +75,7 @@ async fn serve() -> Result<()> {
         log!("INFO", "Stratum V2 on :{} (authority key {})", cfg.sv2_port, sv2.authority.public);
         tokio::spawn(sv2::serve(pool.clone(), sv2, l));
     }
-    log!("INFO", "Solo45 Core {}: stratum on :{}, api on :{}{}, height {}, pays {} by default{}",
+    log!("INFO", "Solo45 SV2 {}: stratum on :{}, api on :{}{}, height {}, pays {} by default{}",
         env!("CARGO_PKG_VERSION"), cfg.stratum_port, cfg.api_port,
         if cfg.web_port != 0 { format!(", status page on :{}", cfg.web_port) } else { String::new() },
         pool.current().map_or(0, |j| j.height),

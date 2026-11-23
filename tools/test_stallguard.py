@@ -109,7 +109,7 @@ def main():
                BITCOIN_RPC_URL=f"http://127.0.0.1:{PROXY_PORT}/", BITCOIN_RPC_COOKIE=os.path.join(NODE_DIR, "regtest/.cookie"))
     core = subprocess.Popen([CORE, "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        check("Core started through the stand-in", wait_for(lambda: "Solo45 Core" in log_text(), 15))
+        check("Core started through the stand-in", wait_for(lambda: "Solo45 SV2" in log_text(), 15))
         check("the guard is set to 20 s", api()["pool"]["stall_guard"]["seconds"] == 20)
 
         # 1. a peer holds up the next block

@@ -173,12 +173,12 @@ async fn handle(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr, kind: Kind
                 return;
             }
             if !trusted {
-                log!("WARNING", "status page: refused a request from {} (open Solo45 Core from the Umbrel home screen)", peer.ip());
-                (403, Body::Json(json!({"error": "open Solo45 Core from your Umbrel's home screen"})))
+                log!("WARNING", "status page: refused a request from {} (open Solo45 SV2 from the Umbrel home screen)", peer.ip());
+                (403, Body::Json(json!({"error": "open Solo45 SV2 from your Umbrel's home screen"})))
             } else if method == "GET" && (path == "/" || path.starts_with("/?")) {
                 (200, Body::Html(PAGE))
             } else if method == "POST" && !q.same_origin() {
-                (403, Body::Json(json!({"error": "changes are only accepted from the Solo45 Core page itself"})))
+                (403, Body::Json(json!({"error": "changes are only accepted from the Solo45 SV2 page itself"})))
             } else {
                 if matches!((method.as_str(), p), ("GET", "/api/state" | "/api/export" | "/api/shares" | "/api/history")
                     | ("POST", "/api/worker" | "/api/settings" | "/api/payout" | "/api/policy" | "/api/restore")) {
