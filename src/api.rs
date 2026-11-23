@@ -49,6 +49,25 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Option<String> {
     }
 }
 
+/// "%20" etc. in a query value back to text (invalid sequences are kept as they are).
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -217,7 +236,11 @@ async fn route<R: AsyncRead + Unpin>(pool: &Arc<Pool>, method: &str, path: &str,
             }
         }
         ("GET", "/api/export") => (200, pool.export_settings()),
-        ("GET", "/api/history") => (200, pool.history()),
+        ("GET", "/api/history") => {
+            // ?worker=NAME: that miner's own 24 h readings (names are percent-encoded by the page)
+            let w = query.split('&').find_map(|kv| kv.strip_prefix("worker=")).map(pct_decode);
+            (200, pool.history(w.as_deref()))
+        }
         ("GET", "/api/shares") => {
             let since = query.split('&').find_map(|kv| kv.strip_prefix("since=")).and_then(|v| v.parse().ok()).unwrap_or(0);
             (200, pool.shares_since(since))

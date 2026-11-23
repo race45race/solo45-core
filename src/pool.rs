@@ -181,6 +181,18 @@ pub struct Stats {
     pub sv2_times: VecDeque<u64>,
     /// one reading a minute for the last 24 h: [time, pool TH/s over 5 min, miners]
     pub history: VecDeque<(u64, f64, usize)>,
+    /// the last 30 new blocks: how fast their work went out (V1, SV2), when the full template followed, the node's check
+    pub recent: VecDeque<Value>,
+    /// one reading a minute per miner name for the last 24 h: (time, TH/s over 5 min); for the per-miner chart
+    pub worker_history: HashMap<String, VecDeque<(u64, f64)>>,
+}
+
+const RECENT_BLOCKS: usize = 30;
+
+impl Stats {
+    fn recent_for(&mut self, height: u64) -> Option<&mut Value> {
+        self.recent.iter_mut().rev().find(|r| r["height"].as_u64() == Some(height))
+    }
 }
 
 fn push_capped(q: &mut VecDeque<u64>, v: u64) {
@@ -595,11 +607,29 @@ impl Pool {
         *self.tip.write().unwrap() = job.prev_hex.clone();
     }
 
-    fn note_switch(&self, job: &Job, ms: u64, workers: usize) {
+    fn note_switch(&self, job: &Job, ms: u64, workers: usize, source: &str) {
         let mut s = self.stats.lock().unwrap();
-        s.last_switch = json!({"height": job.height, "ms": ms, "at": now_f(), "workers": workers});
+        let at = now_f();
+        s.last_switch = json!({"height": job.height, "ms": ms, "at": at, "workers": workers});
         if workers > 0 {
             push_capped(&mut s.build_times, ms); // not the first job after a start
+        }
+        s.recent.push_back(json!({"height": job.height, "at": at, "source": source, "v1_ms": ms, "workers": workers,
+                                  "empty": job.empty, "txs": job.tx_data.len(), "fees": job.fees}));
+        while s.recent.len() > RECENT_BLOCKS {
+            s.recent.pop_front();
+        }
+    }
+
+    /// The full template that followed a new block's empty job.
+    fn note_filled(&self, job: &Job) {
+        let mut s = self.stats.lock().unwrap();
+        if let Some(r) = s.recent_for(job.height) {
+            if r["full_after_s"].is_null() {
+                r["full_after_s"] = json!(((now_f() - r["at"].as_f64().unwrap_or(0.0)) * 10.0).round() / 10.0);
+                r["txs"] = json!(job.tx_data.len());
+                r["fees"] = json!(job.fees);
+            }
         }
     }
 
@@ -699,7 +729,11 @@ impl Pool {
                 let _ = self.job_tx.send(NewJob { job: j.clone(), clean: clean || new_block, flush: u.flush });
                 let ms = t0.elapsed().as_millis() as u64;
                 if new_block {
-                    self.note_switch(&j, ms, workers);
+                    self.note_switch(&j, ms, workers, u.source.as_deref().unwrap_or("node"));
+                } else if filled {
+                    self.note_filled(&j);
+                }
+                if new_block {
                     log!("INFO", "new network block {} ({}), now mining {}{}", j.height - 1, j.prev_hex, j.height,
                         u.source.as_ref().map(|s| format!(" (spotted by the {})", s)).unwrap_or_default());
                 }
@@ -759,7 +793,7 @@ impl Pool {
         let workers = self.worker_count();
         let _ = self.job_tx.send(NewJob { job: j.clone(), clean: true, flush: false });
         let ms = t0.elapsed().as_millis() as u64;
-        self.note_switch(&j, ms, workers);
+        self.note_switch(&j, ms, workers, source);
         log!("INFO", "new network block {} ({}), now mining {} (spotted by the {})", j.height - 1, j.prev_hex, j.height, source);
         log!("INFO", "new-block job {} for block {}: empty (coinbase only, {:.8} BTC), sent to {} workers in {} ms; \
                       the full template follows in {} s", j.id, j.height, j.value as f64 / 1e8, workers, ms, g3(self.empty_hold_s()));
@@ -902,6 +936,11 @@ impl Pool {
             let mut s = self.stats.lock().unwrap();
             push_capped(&mut s.check_times, ms);
             s.proposal = json!({"ok": ok, "result": res, "height": job.height, "at": now_f(), "outputs": 1});
+            // the block's row shows the check of its newest job (the full template once it is out)
+            if let Some(r) = s.recent_for(job.height) {
+                r["check_ok"] = json!(ok);
+                r["check_ms"] = json!(ms);
+            }
             if ok {
                 s.proposal_checked.insert(spk);
             }
@@ -1116,6 +1155,10 @@ impl Pool {
         push_capped(&mut s.sv2_times, ms);
         let n = if same { s.sv2_switch["channels"].as_u64().unwrap_or(0) as usize + channels } else { channels };
         s.sv2_switch = json!({"height": height, "ms": ms, "at": now_f(), "channels": n});
+        if let Some(r) = s.recent_for(height) {
+            r["sv2_ms"] = json!(ms);
+            r["channels"] = json!(n);
+        }
     }
 
     fn history_path(&self) -> String {
@@ -1138,17 +1181,46 @@ impl Pool {
     }
 
     fn save_history(&self) {
-        let body = json!(self.stats.lock().unwrap().history.iter().map(|(t, h, n)| json!([t, (h * 1000.0).round() / 1000.0, n]))
-            .collect::<Vec<_>>()).to_string();
-        let tmp = format!("{}.tmp", self.history_path());
-        if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, self.history_path())) {
-            log!("WARNING", "couldn't save the hashrate history: {}", e);
+        let (body, wbody) = {
+            let s = self.stats.lock().unwrap();
+            (json!(s.history.iter().map(|(t, h, n)| json!([t, (h * 1000.0).round() / 1000.0, n])).collect::<Vec<_>>()).to_string(),
+             json!(s.worker_history.iter().map(|(k, q)| (k.clone(), json!(q.iter().map(|(t, h)| json!([t, (h * 10000.0).round() / 10000.0]))
+                 .collect::<Vec<_>>()))).collect::<Map<String, Value>>()).to_string())
+        };
+        for (path, body) in [(self.history_path(), body), (self.worker_history_path(), wbody)] {
+            let tmp = format!("{}.tmp", path);
+            if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &path)) {
+                log!("WARNING", "couldn't save the hashrate history: {}", e);
+            }
         }
     }
 
-    pub fn history(&self) -> Value {
+    fn worker_history_path(&self) -> String {
+        format!("{}/history-miners.json", self.cfg.data_dir)
+    }
+
+    /// Per-miner readings from the last 24 h saved by an earlier run.
+    fn load_worker_history(&self) {
+        let Ok(text) = std::fs::read_to_string(self.worker_history_path()) else { return };
+        let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&text) else { return };
+        let cutoff = now_f() as u64 - 86400;
+        let mut s = self.stats.lock().unwrap();
+        for (name, rows) in m.into_iter().take(200) {
+            let q: VecDeque<(u64, f64)> = rows.as_array().into_iter().flatten()
+                .filter_map(|r| Some((r[0].as_u64()?, r[1].as_f64()?))).filter(|x| x.0 >= cutoff).collect();
+            if !q.is_empty() {
+                s.worker_history.insert(name, q);
+            }
+        }
+    }
+
+    /// The 24 h chart: the pool's, or one miner's (`worker`) as [time, TH/s].
+    pub fn history(&self, worker: Option<&str>) -> Value {
         let s = self.stats.lock().unwrap();
-        json!({"history": s.history.iter().map(|(t, h, n)| json!([t, h, n])).collect::<Vec<_>>()})
+        match worker {
+            Some(w) => json!({"worker": w, "history": s.worker_history.get(w).map(|q| q.iter().map(|(t, h)| json!([t, h])).collect::<Vec<_>>()).unwrap_or_default()}),
+            None => json!({"history": s.history.iter().map(|(t, h, n)| json!([t, h, n])).collect::<Vec<_>>()}),
+        }
     }
 
     pub fn share_accepted(&self, name: &str, credit: f64, share_diff: f64, now: f64, block: bool) {
@@ -1303,12 +1375,33 @@ impl Pool {
                 trim_memory();
                 {
                     let workers = self.worker_count();
+                    // each miner's 5-minute hashrate (connections with the same name add up)
+                    let mut per: HashMap<String, f64> = HashMap::new();
+                    for h in self.workers.lock().unwrap().values() {
+                        let i = h.info.lock().unwrap();
+                        if i.name.is_empty() {
+                            continue;
+                        }
+                        let since = (now - i.connected).max(60.0);
+                        *per.entry(i.name.clone()).or_default() += hashrate(i.shares.iter(), 300f64.min(since), now) / 1e12;
+                    }
                     let mut s = self.stats.lock().unwrap();
                     let th = hashrate(s.shares.iter(), 300f64.min((now - self.started).max(60.0)), now) / 1e12;
                     s.history.push_back((now as u64, th, workers));
                     while s.history.front().map_or(false, |x| x.0 + 86400 < now as u64) {
                         s.history.pop_front();
                     }
+                    for (name, th) in per {
+                        if s.worker_history.len() < 200 || s.worker_history.contains_key(&name) {
+                            s.worker_history.entry(name).or_default().push_back((now as u64, th));
+                        }
+                    }
+                    for q in s.worker_history.values_mut() {
+                        while q.front().map_or(false, |x| x.0 + 86400 < now as u64) {
+                            q.pop_front();
+                        }
+                    }
+                    s.worker_history.retain(|_, q| !q.is_empty());
                 }
                 if n % 40 == 0 {
                     self.save_history(); // every 10 minutes
@@ -1413,6 +1506,7 @@ impl Pool {
             tokio::spawn(self.clone().resolve_readers()); // IPs as given, names looked up every minute
         }
         self.load_history();
+        self.load_worker_history();
         tokio::spawn(self.clone().housekeeping());
         tokio::spawn(self.clone().stall_guard_loop());
         if std::env::var("SOLO45_MINER_READINGS").map_or(true, |v| v != "0") {
@@ -1571,6 +1665,7 @@ impl Pool {
                 "blocks": st["blocks"],
                 "last_switch": s.last_switch,
                 "sv2_switch": {"last": s.sv2_switch, "ms_median": median(s.sv2_times.iter()), "blocks": s.sv2_times.len()},
+                "recent_blocks": s.recent.iter().collect::<Vec<_>>(),
                 "proposal": s.proposal,
                 "timing": {"build_ms": median(s.build_times.iter()), "blocks": s.build_times.len(),
                            "check_ms": median(s.check_times.iter()), "checks": s.check_times.len(),

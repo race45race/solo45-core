@@ -35,7 +35,7 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   mainnet templates. `solo45-core sv2-miner <host:port> <authority key> <user> <shares>` is a small CPU test miner
   for standard channels.
 - **Status page:** hashrate over 24 hours, live shares, each miner's best share ever, each miner's temperature, fan
-  and watts (read every 30 s from Bitaxes over AxeOS and from Braiins OS miners over port 4028; read only, no logins), the pool settings (job updates, always pay my address, empty block first, electricity price and power cost a day), each miner's share difficulty (automatic, seconds per share or fixed), block switch times (V1 and
+  and watts (read every 30 s from Bitaxes over AxeOS and from Braiins OS miners over port 4028; read only, no logins), the pool settings (job updates, always pay my address, empty block first, electricity price and power cost a day), each miner's share difficulty (automatic, seconds per share or fixed), a 24-hour chart per miner, the last 30 new blocks (work to V1 and SV2 miners, full template, node's check), block switch times (V1 and
   SV2), the node's block check, settings and backup/restore. `?screenshot` hides the payout address and miner IPs.
 - **Small and fast.** One binary. Load test (tools/load_test.py) with 100 Stratum V1 and 20 Stratum V2 miners on
   mainnet templates for 12 minutes: 7,469 shares, 0.7% of one CPU core, 33-76 MB of memory, a new block's work to
@@ -117,7 +117,7 @@ dashboard) may only read `/api/state`, `/api/shares` and `/api/history`, and POS
 |---|---|---|
 | `GET /api/state` | snapshot | `pool` (height, hashrate_1h / _5m in H/s, network_diff, accepted, rejected, best, last_switch, sv2_switch, timing, policy, …), `workers` (name, ip, agent, address, diff, hashrate, accepted, rejected, last_share, best_ever, override, device: temp, vr_temp, fan, watts), `sv2` (port, authority key), `version`, `uptime` |
 | `GET /api/shares?since=N` | live share feed | shares with a sequence number above N (worker, diff, share difficulty, time) |
-| `GET /api/history` | 24 h chart | `{"history": [[time, hashrate H/s, miners], …]}` |
+| `GET /api/history` | 24 h chart | `{"history": [[time, hashrate TH/s, miners], …]}`; `?worker=NAME`: that miner's `[[time, TH/s], …]` |
 | `GET /api/export` | backup | settings, per-miner overrides, policy, last difficulties |
 | `POST /api/worker` | per-miner difficulty | `{"name": "Bitaxe7", "diff": 2000}`, `{"name": …, "share_seconds": 10}`, or `{"name": …}` for automatic |
 | `POST /api/settings` | pool settings | any of `template_refresh_s` (1-120), `stall_guard_s` (0 or 20-600), `empty_first`, `empty_hold_s` (1-40), `force_default_address`, `electricity_usd_kwh` (0-2, for the power cost) |

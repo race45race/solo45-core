@@ -86,11 +86,23 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
     <thead><tr><th>Miner</th><th>Protocol</th><th>Hashrate 1 h</th><th>5 min</th><th title="Read from the miner itself every 30 s: chip temperature / voltage regulator (Bitaxe) or board (Braiins OS)">Temp</th><th>Fan</th><th>Power</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th title="Best share since it connected">Best now</th><th>Best ever</th><th>Last share</th></tr></thead>
     <tbody id="workers"><tr><td colspan="10" class="dim">No miners yet.</td></tr></tbody>
   </table></div>
+  <div class="s" style="margin-top:4px">Click a miner for its own 24-hour chart.</div>
+  <div class="card chart" id="mchartwrap" hidden style="margin-top:8px">
+    <div class="k"><span id="mchartname"></span>, last 24 hours <a href="#" id="mchartclose" class="dim" style="float:right;text-decoration:none">close ✕</a></div>
+    <svg id="mchart" viewBox="0 0 600 150" preserveAspectRatio="none" role="img" aria-label="Miner hashrate over the last 24 hours"></svg>
+    <div class="s" id="mchartnote"></div>
+  </div>
 
   <h2>Live shares</h2>
   <div class="tablewrap"><table>
     <thead><tr><th>Time</th><th>Miner</th><th>Share</th><th>Difficulty</th><th>Result</th></tr></thead>
     <tbody id="shares"><tr><td colspan="5" class="dim">Waiting for shares…</td></tr></tbody>
+  </table></div>
+
+  <h2>Recent blocks</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Block</th><th>When</th><th>Spotted by</th><th title="New block → work sent to the Stratum V1 miners">To V1 miners</th><th title="New block → work sent to the Stratum V2 channels">To SV2 miners</th><th title="Empty block first: when the full template with fees followed">Full template</th><th>Txs</th><th>Fees</th><th>Node's check</th></tr></thead>
+    <tbody id="recent"><tr><td colspan="9" class="dim">The next new block shows here (kept since this pool started).</td></tr></tbody>
   </table></div>
 
   <div id="blockwrap" hidden>
@@ -294,12 +306,22 @@ function render(d) {
   renderDiffs(ws, p, now);
   $("workers").innerHTML = ws.length ? ws.map(w => {
     const r = sum(w.rejected), stale = now - (w.last_share || 0) > 300;
-    return `<tr><td><b>${esc(w.name)}</b> <span class="dim">${SHOT ? "" : esc(w.ip)}</span></td>` +
+    return `<tr class="mrow" data-name="${esc(w.name)}" style="cursor:pointer"><td><b>${esc(w.name)}</b> <span class="dim">${SHOT ? "" : esc(w.ip)}</span></td>` +
       `<td title="${w.protocol && w.protocol.startsWith("SV2") ? "Stratum V2: encrypted, checked against this pool's key" : "Stratum V1"}">${esc(w.protocol || "V1")}</td>` +
       `<td>${esc(hs(w.hashrate_1h))}</td><td>${esc(hs(w.hashrate_5m))}</td>` + devCells(w.device) + `<td>${esc(si(w.diff))}</td>` +
       `<td>${esc((w.accepted || 0).toLocaleString())}</td><td class="${r ? "warn" : ""}">${esc(r)}</td>` +
       `<td>${esc(si(w.best))}</td><td>${esc(si(w.best_ever || w.best))}</td><td class="${stale ? "bad" : ""}">${esc(ago(w.last_share, now))}</td></tr>`;
   }).join("") : `<tr><td colspan="13" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
+  const rb = (p.recent_blocks || []).slice().reverse();
+  if (rb.length) $("recent").innerHTML = rb.map(b => {
+    const ms = v => v == null ? "–" : v + " ms";
+    const chk = b.check_ok === true ? `<span class="good">OK</span> ${esc(b.check_ms)} ms` : b.check_ok === false ? `<span class="bad">FAILED</span>` : "–";
+    return `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(ago(b.at, now))}</td><td>${esc(({zmq: "block signal", "node's block signal": "block signal"})[b.source] || b.source || "-")}</td>` +
+      `<td>${esc(ms(b.v1_ms))}${b.workers != null ? ` <span class="dim">(${esc(b.workers)})</span>` : ""}</td>` +
+      `<td>${esc(ms(b.sv2_ms))}${b.channels != null ? ` <span class="dim">(${esc(b.channels)})</span>` : ""}</td>` +
+      `<td>${b.empty ? (b.full_after_s != null ? esc(b.full_after_s + " s later") : "waiting…") : "at once"}</td>` +
+      `<td>${esc((b.txs || 0).toLocaleString())}</td><td>${esc(btc(b.fees || 0))}</td><td>${chk}</td></tr>`;
+  }).join("");
   const blocks = (p.blocks || []).slice().reverse();
   $("blockwrap").hidden = !blocks.length;
   $("blocks").innerHTML = blocks.map(b => `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(b.worker)}</td>` +
@@ -508,6 +530,45 @@ $("bkfile").addEventListener("change", async ev => {
   post("api/restore", data, "bkmsg", j => (j.ok ? "Restored: " : "Partly restored: ") + (j.restored || []).join(", ") +
        (j.errors && j.errors.length ? ". Problems: " + j.errors.join("; ") : "."));
 });
+// a miner's own 24 h chart (click its row): one reading a minute, kept across restarts
+let mName = null;
+function drawLine(svg, rows) {  // rows: [[time, TH/s], ...] over the last 24 h
+  const now = Date.now() / 1000, t0 = now - 86400, h = rows.filter(x => x[0] >= t0);
+  if (h.length < 2) { svg.innerHTML = ""; return null; }
+  const max = Math.max(...h.map(x => x[1]), 0.001) * 1.15;
+  const X = t => Math.max(0, (t - t0) / 86400 * 600), Y = v => 140 - v / max * 130;
+  const pts = h.map(x => `${X(x[0]).toFixed(1)},${Y(x[1]).toFixed(1)}`);
+  const grid = [0.25, 0.5, 0.75, 1].map(f => `<line class="grid" x1="0" x2="600" y1="${Y(max / 1.15 * f)}" y2="${Y(max / 1.15 * f)}"/>` +
+    `<text x="2" y="${Y(max / 1.15 * f) - 2}">${si(max / 1.15 * f * 1e12, "H/s")}</text>`).join("");
+  const first = pts[0].split(",")[0], last = pts[pts.length - 1].split(",")[0];
+  svg.innerHTML = grid + `<polygon class="area" points="${first},140 ${pts.join(" ")} ${last},140"/><polyline class="line" points="${pts.join(" ")}"/>`;
+  return h;
+}
+async function refreshMinerChart() {
+  if (!mName) return;
+  try {
+    const r = await fetch("api/history?worker=" + encodeURIComponent(mName), {cache: "no-store"});
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.worker !== mName) return;
+    const h = drawLine($("mchart"), j.history || []);
+    $("mchartnote").textContent = !h ? "Not enough readings yet: one a minute while it mines here."
+      : `Average ${si(h.reduce((a, x) => a + x[1], 0) / h.length * 1e12, "H/s")} over ${h.length >= 1400 ? "24 hours" : Math.round(h.length / 60 * 10) / 10 + " hours"}` +
+        `; lowest ${si(Math.min(...h.map(x => x[1])) * 1e12, "H/s")}, highest ${si(Math.max(...h.map(x => x[1])) * 1e12, "H/s")} (5-minute readings).`;
+  } catch (e) { /* tried again in a minute */ }
+}
+$("workers").addEventListener("click", ev => {
+  const tr = ev.target.closest("tr.mrow");
+  if (!tr) return;
+  mName = tr.dataset.name;
+  $("mchartname").textContent = mName;
+  $("mchartwrap").hidden = false;
+  $("mchart").innerHTML = "";
+  $("mchartnote").textContent = "Loading…";
+  refreshMinerChart();
+});
+$("mchartclose").addEventListener("click", ev => { ev.preventDefault(); mName = null; $("mchartwrap").hidden = true; });
+setInterval(refreshMinerChart, 60000);
 // the 24 h hashrate chart: one reading a minute from the pool (kept across restarts)
 async function refreshChart() {
   try {
