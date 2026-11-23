@@ -43,6 +43,17 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
 
 Planned: job declaration, a proxy mode and public stats pages.
 
+## Screenshots
+
+The status page, live on the author's Umbrel (screenshot mode: payout address and miner IPs hidden). Three miners
+on Stratum V2 (two Bitaxes on extended channels, an Antminer S19K Pro on Braiins OS on a standard channel), new
+block work to every miner in a few milliseconds, 0 rejected shares.
+
+<p align="center"><img src="docs/gallery/1-overview.png" alt="Solo45 Core status page" width="78%">
+&nbsp;<img src="docs/gallery/3-phone.jpg" alt="Solo45 Core on a phone" width="19%"></p>
+
+[The whole page](docs/gallery/2-full-page.png): live shares, payout, template policy, stall guard.
+
 ## Install on Umbrel
 
 1. Add the community app store `https://github.com/race45race/solo45` in umbrelOS (App Store → ⋯ → Community App
