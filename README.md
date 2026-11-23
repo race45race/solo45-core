@@ -34,7 +34,11 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   on a private regtest chain (blocks with segwit transactions accepted by the node, over both channel types) and on
   mainnet templates. `solo45-core sv2-miner <host:port> <authority key> <user> <shares>` is a small CPU test miner
   for standard channels.
-- **Status page:** hashrate over 24 hours, live shares, each miner's best share ever, each miner's temperature, fan
+- **The full Solo45 dashboard (Umbrel app):** the app also runs its own copy of the
+  [Solo45](https://github.com/race45race/solo45) dashboard, named Solo45 SV2 and reading only this pool: Home,
+  Details and Settings tabs with fleet hashrate and odds, every miner's temperature, fan, watts and tuning, best shares
+  and journeys, block timing, luck, network and node, phone alerts and backup. It needs nothing from the Solo45 app.
+- **Built-in status page** (also without Umbrel): hashrate over 24 hours, live shares, each miner's best share ever, each miner's temperature, fan
   and watts (read every 30 s from Bitaxes over AxeOS and from Braiins OS and Canaan Avalon miners over port 4028; read only, no logins), the pool settings (job updates, always pay my address, empty block first, electricity price and power cost a day), each miner's share difficulty (automatic, seconds per share or fixed), a 24-hour chart per miner, the last 30 new blocks (work to V1 and SV2 miners, full template, node's check), block switch times (V1 and
   SV2), the node's block check, settings and backup/restore. `?screenshot` hides the payout address and miner IPs.
 - **Small and fast.** One binary. Load test (tools/load_test.py) with 100 Stratum V1 and 20 Stratum V2 miners on
@@ -47,9 +51,8 @@ Planned: job declaration, a proxy mode and public stats pages.
 
 ## Screenshots
 
-The status page, live on the author's Umbrel (screenshot mode: payout address and miner IPs hidden). Three miners
-on Stratum V2 (two Bitaxes on extended channels, an Antminer S19K Pro on Braiins OS on a standard channel) with their temperature, fan and watts, new
-block work to every miner in a few milliseconds, 0 rejected shares.
+The pool's built-in status page (screenshot mode: payout address and miner IPs hidden). In the Umbrel app, the
+Solo45 SV2 dashboard is what opens from the home screen; new screenshots of it follow.
 
 <p align="center"><img src="docs/gallery/1-overview.png" alt="Solo45 SV2 status page" width="78%">
 &nbsp;<img src="docs/gallery/3-phone.jpg" alt="Solo45 SV2 on a phone" width="19%"></p>
@@ -60,7 +63,7 @@ block work to every miner in a few milliseconds, 0 rejected shares.
 
 1. Add the community app store `https://github.com/race45race/solo45` in umbrelOS (App Store → ⋯ → Community App
    Stores) and install **Solo45 SV2**. It needs the **Bitcoin Node** app, fully synced.
-2. Open Solo45 SV2 and enter your **payout address**. Your node checks it before it's saved.
+2. Open Solo45 SV2 (its dashboard) and enter your **payout address** on the Settings tab. Your node checks it before it's saved.
 3. Point a miner at **`stratum+tcp://<your Umbrel's IP>:3346`**. Keep a backup pool set on every miner.
 
 Keep port 3346 on your home network: don't forward it to the internet.
