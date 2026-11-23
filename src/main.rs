@@ -9,6 +9,7 @@
 #![recursion_limit = "256"] // the API snapshot is one large json! object
 
 mod api;
+mod devices;
 mod job;
 mod pool;
 mod policy;
@@ -37,7 +38,11 @@ async fn main() -> Result<()> {
         Some("policy") if args.len() == 4 => policy_dump(&args[2], &args[3]),
         Some("sv2-miner") if args.len() == 6 || args.len() == 7 =>
             sv2::test_miner(&args[2], &args[3], &args[4], args[5].parse()?, args.get(6).map_or(Ok(0.0), |a| a.parse())?).await,
-        _ => bail!("usage: solo45-core serve | version | node | job <template.json> <tag> <spk_hex> | policy <template.json> <config.json>"),
+        Some("read-miner") if args.len() == 3 => {
+            println!("{}", devices::read_once(&args[2]).await);
+            Ok(())
+        }
+        _ => bail!("usage: solo45-core serve | version | node | job <template.json> <tag> <spk_hex> | policy <template.json> <config.json> | read-miner <ip>"),
     }
 }
 

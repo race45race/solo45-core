@@ -32,7 +32,7 @@ main{max-width:1100px;margin:0 auto;padding:16px}
 h2{font-size:15px;margin:22px 0 8px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .tablewrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-th,td{padding:8px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
+th,td{padding:8px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
 th:first-child,td:first-child{text-align:left}
 th{color:var(--dim);font-weight:500;font-size:12px;text-transform:uppercase}
 tr:last-child td{border-bottom:0}
@@ -75,7 +75,7 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 
   <h2>Miners</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Miner</th><th>Protocol</th><th>Hashrate 1 h</th><th>5 min</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th>Best (since it connected)</th><th>Best ever</th><th>Last share</th></tr></thead>
+    <thead><tr><th>Miner</th><th>Protocol</th><th>Hashrate 1 h</th><th>5 min</th><th title="Read from the miner itself every 30 s: chip temperature / voltage regulator (Bitaxe) or board (Braiins OS)">Temp</th><th>Fan</th><th>Power</th><th>Difficulty</th><th>Accepted</th><th>Rejected</th><th title="Best share since it connected">Best now</th><th>Best ever</th><th>Last share</th></tr></thead>
     <tbody id="workers"><tr><td colspan="10" class="dim">No miners yet.</td></tr></tbody>
   </table></div>
 
@@ -107,9 +107,9 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px 16px 30px}
 
   <h2>Template policy</h2>
   <div class="card">
-    <div class="s">Leave chosen kinds of transactions out of the blocks Core builds. <b>Watch</b> only counts what a rule would
+    <div class="s">Leave chosen kinds of transactions out of the blocks this pool builds. <b>Watch</b> only counts what a rule would
       skip (and the fees it would cost); <b>Filter</b> leaves them out. Your node still checks every job, and if a filtered
-      job ever fails that check, Core mines the node's own template for that block.</div>
+      job ever fails that check, the pool mines the node's own template for that block.</div>
     <div id="polnow" class="s" style="margin-top:8px"></div>
     <div class="rules">
       <label>Mode <select id="pmode"><option value="off">Off</option><option value="watch">Watch only</option><option value="filter">Filter</option></select></label>
@@ -182,6 +182,15 @@ function si(n, unit = "") {
 const hs = h => si(h, "H/s");
 const btc = sat => (sat / 1e8).toFixed(8).replace(/0{1,4}$/, "") + " BTC";
 const sum = o => typeof o === "number" ? o : Object.values(o || {}).reduce((a, b) => a + b, 0);
+// a miner's own readings (devices.rs): temperature, fan and watts, or a dash when it can't be read
+function devCells(d) {
+  if (!d) return `<td class="dim" title="No readings: the miner's API didn't answer (only Bitaxe/AxeOS and Braiins OS are read)">–</td><td class="dim">–</td><td class="dim">–</td>`;
+  const n = (v, unit, dp) => v == null ? "–" : Number(v).toLocaleString(undefined, {maximumFractionDigits: dp || 0}) + unit;
+  const hot = d.kind === "bitaxe" ? (d.temp >= 68 || d.vr_temp >= 85) : d.temp >= 85;
+  const tip = [d.model, d.freq ? d.freq + " MHz" : "", d.mv ? d.mv + " mV" : ""].filter(Boolean).join(" · ");
+  return `<td class="${hot ? "warn" : ""}" title="${esc(tip)}">${esc(n(d.temp, "°") + (d.vr_temp != null ? " / " + n(d.vr_temp, "°") : ""))}</td>` +
+    `<td>${esc(n(d.fan, "%"))}</td><td>${esc(n(d.watts, " W"))}</td>`;
+}
 function ago(t, now) {
   if (!t) return "never";
   const s = Math.max(0, now - t);
@@ -245,10 +254,10 @@ function render(d) {
     const r = sum(w.rejected), stale = now - (w.last_share || 0) > 300;
     return `<tr><td><b>${esc(w.name)}</b> <span class="dim">${SHOT ? "" : esc(w.ip)}</span></td>` +
       `<td title="${w.protocol && w.protocol.startsWith("SV2") ? "Stratum V2: encrypted, checked against this pool's key" : "Stratum V1"}">${esc(w.protocol || "V1")}</td>` +
-      `<td>${esc(hs(w.hashrate_1h))}</td><td>${esc(hs(w.hashrate_5m))}</td><td>${esc(si(w.diff))}</td>` +
+      `<td>${esc(hs(w.hashrate_1h))}</td><td>${esc(hs(w.hashrate_5m))}</td>` + devCells(w.device) + `<td>${esc(si(w.diff))}</td>` +
       `<td>${esc((w.accepted || 0).toLocaleString())}</td><td class="${r ? "warn" : ""}">${esc(r)}</td>` +
       `<td>${esc(si(w.best))}</td><td>${esc(si(w.best_ever || w.best))}</td><td class="${stale ? "bad" : ""}">${esc(ago(w.last_share, now))}</td></tr>`;
-  }).join("") : `<tr><td colspan="10" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
+  }).join("") : `<tr><td colspan="13" class="dim">No miners yet. Point a miner at this Umbrel's IP address on port ${esc(port)}.</td></tr>`;
   const blocks = (p.blocks || []).slice().reverse();
   $("blockwrap").hidden = !blocks.length;
   $("blocks").innerHTML = blocks.map(b => `<tr><td>${esc((b.height || 0).toLocaleString())}</td><td>${esc(b.worker)}</td>` +

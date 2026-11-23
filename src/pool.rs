@@ -371,6 +371,8 @@ pub struct Pool {
     pub sv2_info: RwLock<Value>,
     /// the readers' current addresses (SOLO45_WEB_READERS: IPs as given, names looked up every minute)
     pub readers: RwLock<Vec<std::net::Ipv4Addr>>,
+    /// the latest hardware readings (temperature, fan, watts) of each connected miner, by IP (devices.rs)
+    pub devices: RwLock<HashMap<String, Value>>,
     pub started: f64,
 }
 
@@ -403,6 +405,7 @@ impl Pool {
             policy: Mutex::new(pstate),
             sv2_info: RwLock::new(Value::Null),
             readers: RwLock::new(Vec::new()), // filled by resolve_readers
+            devices: RwLock::new(HashMap::new()), // filled by devices::poll_loop
             rpc,
             jobs: RwLock::new(VecDeque::new()),
             current: RwLock::new(None),
@@ -1412,7 +1415,15 @@ impl Pool {
         self.load_history();
         tokio::spawn(self.clone().housekeeping());
         tokio::spawn(self.clone().stall_guard_loop());
+        if std::env::var("SOLO45_MINER_READINGS").map_or(true, |v| v != "0") {
+            tokio::spawn(crate::devices::poll_loop(self.clone())); // temperature, fan, watts from each miner
+        }
         Ok(())
+    }
+
+    /// The IP addresses of the miners connected right now.
+    pub fn worker_ips(&self) -> Vec<String> {
+        self.workers.lock().unwrap().values().map(|h| h.info.lock().unwrap().ip.clone()).collect()
     }
 
     /// Every 5 s: is the node stuck on a block one peer won't send? Then drop that peer (pool.py's stall_guard_loop).
@@ -1515,8 +1526,12 @@ impl Pool {
         for w in workers.iter_mut() {
             w["best_ever"] = miner_best[w["name"].as_str().unwrap_or("")]["diff"].clone();
         }
-        for w in workers.iter_mut() {
-            w["override"] = self.override_for(w["name"].as_str().unwrap_or(""));
+        {
+            let dev = self.devices.read().unwrap();
+            for w in workers.iter_mut() {
+                w["override"] = self.override_for(w["name"].as_str().unwrap_or(""));
+                w["device"] = dev.get(w["ip"].as_str().unwrap_or("")).cloned().unwrap_or(Value::Null);
+            }
         }
         let s = self.stats.lock().unwrap();
         let st = self.state.lock().unwrap();

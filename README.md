@@ -34,7 +34,8 @@ no pool fee. It runs next to the Solo45 app, on its own port, so you can move mi
   on a private regtest chain (blocks with segwit transactions accepted by the node, over both channel types) and on
   mainnet templates. `solo45-core sv2-miner <host:port> <authority key> <user> <shares>` is a small CPU test miner
   for standard channels.
-- **Status page:** hashrate over 24 hours, live shares, each miner's best share ever, block switch times (V1 and
+- **Status page:** hashrate over 24 hours, live shares, each miner's best share ever, each miner's temperature, fan
+  and watts (read every 30 s from Bitaxes over AxeOS and from Braiins OS miners over port 4028; read only, no logins), block switch times (V1 and
   SV2), the node's block check, settings and backup/restore. `?screenshot` hides the payout address and miner IPs.
 - **Small and fast.** One binary. Load test (tools/load_test.py) with 100 Stratum V1 and 20 Stratum V2 miners on
   mainnet templates for 12 minutes: 7,469 shares, 0.7% of one CPU core, 33-76 MB of memory, a new block's work to
@@ -71,7 +72,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.18
+  ghcr.io/race45race/solo45-core:v0.0.19
 ```
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
@@ -97,6 +98,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_EMPTY_HOLD_S` | 10 | how long the empty job for a new block runs before the full template |
 | `SOLO45_TEMPLATE_REFRESH_S` | 30 | new job with fresh transactions |
 | `SOLO45_STALL_GUARD_S` | 60 | stall guard (0 = off; the status page setting wins) |
+| `SOLO45_MINER_READINGS` | 1 | read temperature, fan and watts from connected miners on private addresses (0 = off) |
 
 ## API
 
@@ -113,7 +115,7 @@ dashboard) may only read `/api/state`, `/api/shares` and `/api/history`, and POS
 
 | Route | | |
 |---|---|---|
-| `GET /api/state` | snapshot | `pool` (height, hashrate_1h / _5m in H/s, network_diff, accepted, rejected, best, last_switch, sv2_switch, timing, policy, …), `workers` (name, ip, agent, address, diff, hashrate, accepted, rejected, last_share, best_ever, override), `sv2` (port, authority key), `version`, `uptime` |
+| `GET /api/state` | snapshot | `pool` (height, hashrate_1h / _5m in H/s, network_diff, accepted, rejected, best, last_switch, sv2_switch, timing, policy, …), `workers` (name, ip, agent, address, diff, hashrate, accepted, rejected, last_share, best_ever, override, device: temp, vr_temp, fan, watts), `sv2` (port, authority key), `version`, `uptime` |
 | `GET /api/shares?since=N` | live share feed | shares with a sequence number above N (worker, diff, share difficulty, time) |
 | `GET /api/history` | 24 h chart | `{"history": [[time, hashrate H/s, miners], …]}` |
 | `GET /api/export` | backup | settings, per-miner overrides, policy, last difficulties |
