@@ -1584,6 +1584,9 @@ impl Pool {
                 "stratum_port": self.cfg.stratum_port,
                 "sv2": sv2_info,
                 "template_refresh_s": get_f("template_refresh_s", self.cfg.template_refresh_s),
+                "electricity_usd_kwh": settings.get("electricity_usd_kwh").cloned().unwrap_or(Value::Null),
+                "share_seconds": self.cfg.share_seconds,
+                "min_diff": self.cfg.min_diff,
                 "zmq": self.zmq_up.load(Ordering::Relaxed),
                 "stall_guard": {"seconds": stall_s, "events": stall_events},
             },
@@ -1652,7 +1655,7 @@ impl Pool {
 
     /// Pool-wide settings from the dashboard; they take effect at once.
     pub async fn set_settings(self: &Arc<Self>, data: &Value) -> (u16, Value) {
-        let keys = ["template_refresh_s", "stall_guard_s", "force_default_address", "empty_first", "empty_hold_s"];
+        let keys = ["template_refresh_s", "stall_guard_s", "force_default_address", "empty_first", "empty_hold_s", "electricity_usd_kwh"];
         if !keys.iter().any(|k| data.get(*k).is_some()) {
             return (400, json!({"error": "nothing to change"}));
         }
@@ -1680,6 +1683,12 @@ impl Pool {
                 _ => return (400, json!({"error": "the stall guard must be 20 to 600 seconds, or 0 for off"})),
             }
         }
+        if let Some(e) = num("electricity_usd_kwh") {
+            match e {
+                Some(e) if (0.0..=2.0).contains(&e) => {}
+                _ => return (400, json!({"error": "the electricity price must be 0 to 2 dollars per kWh"})),
+            }
+        }
         let repay = data.get("force_default_address").and_then(|v| v.as_bool()).map_or(false, |f| f != self.force_default());
         {
             let mut st = self.state.lock().unwrap();
@@ -1696,7 +1705,7 @@ impl Pool {
         let _ = self.save_state();
         (200, json!({"ok": true, "template_refresh_s": self.refresh_s(), "force_default_address": self.force_default(),
                      "empty_first": self.empty_first_on(), "empty_hold_s": self.empty_hold_s(),
-                     "stall_guard_s": self.stall_guard_s()}))
+                     "stall_guard_s": self.stall_guard_s(), "electricity_usd_kwh": self.setting("electricity_usd_kwh")}))
     }
 
     /// Keep what the policy did to this template (the latest per block), and log it (pool.py's record_policy).
@@ -1788,7 +1797,7 @@ impl Pool {
             step("payout address".into(), self.set_payout(&json!({"address": a})).await);
         }
         let mut ps = Map::new();
-        for k in ["template_refresh_s", "stall_guard_s", "force_default_address", "empty_first", "empty_hold_s"] {
+        for k in ["template_refresh_s", "stall_guard_s", "force_default_address", "empty_first", "empty_hold_s", "electricity_usd_kwh"] {
             if let Some(v) = s.get(k) {
                 ps.insert(k.into(), v.clone());
             }

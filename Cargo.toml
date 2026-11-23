@@ -1,6 +1,6 @@
 [package]
 name = "solo45-core"
-version = "0.0.21"
+version = "0.0.22"
 edition = "2021"
 description = "Solo45 SV2: a fast solo Bitcoin mining pool with Stratum V2 (and V1)"
 license = "MIT"
