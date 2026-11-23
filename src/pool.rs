@@ -1528,9 +1528,15 @@ impl Pool {
         }
         {
             let dev = self.devices.read().unwrap();
+            let mut per_ip: HashMap<String, usize> = HashMap::new();
+            for w in workers.iter() {
+                *per_ip.entry(w["ip"].as_str().unwrap_or("").to_string()).or_default() += 1;
+            }
             for w in workers.iter_mut() {
                 w["override"] = self.override_for(w["name"].as_str().unwrap_or(""));
-                w["device"] = dev.get(w["ip"].as_str().unwrap_or("")).cloned().unwrap_or(Value::Null);
+                // several miners behind one address (a proxy): its readings would be the proxy's, so show none
+                let ip = w["ip"].as_str().unwrap_or("").to_string();
+                w["device"] = if per_ip.get(&ip) == Some(&1) { dev.get(&ip).cloned().unwrap_or(Value::Null) } else { Value::Null };
             }
         }
         let s = self.stats.lock().unwrap();

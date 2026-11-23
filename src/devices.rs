@@ -182,17 +182,36 @@ pub async fn poll_loop(pool: Arc<Pool>) {
             v.dedup();
             v
         };
-        let mut found = HashMap::new();
+        // all miners at once, so one that doesn't answer (timeouts) doesn't hold up the others
+        let mut set = tokio::task::JoinSet::new();
         for ip in &ips {
-            let known = kinds.get(ip).map(|s| s.as_str());
-            let mut d = read_device(ip, known).await;
-            if d.is_none() && known.is_some() {
-                d = read_device(ip, None).await; // firmware changed, or the miner was swapped
-            }
+            let (ip, known) = (ip.clone(), kinds.get(ip).cloned());
+            set.spawn(async move {
+                let mut d = read_device(&ip, known.as_deref()).await;
+                if d.is_none() && known.is_some() {
+                    d = read_device(&ip, None).await; // firmware changed, or the miner was swapped
+                }
+                (ip, d)
+            });
+        }
+        let now = crate::util::now_f();
+        let mut found: HashMap<String, Value> = HashMap::new();
+        while let Some(Ok((ip, d))) = set.join_next().await {
             if let Some(mut d) = d {
                 kinds.insert(ip.clone(), d["kind"].as_str().unwrap_or("").to_string());
-                d["at"] = json!(crate::util::now_f());
-                found.insert(ip.clone(), d);
+                d["at"] = json!(now);
+                found.insert(ip, d);
+            }
+        }
+        // one missed reading keeps the last one for up to 90 s instead of blanking the row
+        {
+            let old = pool.devices.read().unwrap();
+            for ip in &ips {
+                if let Some(o) = old.get(ip) {
+                    if !found.contains_key(ip) && now - o["at"].as_f64().unwrap_or(0.0) < 90.0 {
+                        found.insert(ip.clone(), o.clone());
+                    }
+                }
             }
         }
         kinds.retain(|ip, _| ips.contains(ip));
