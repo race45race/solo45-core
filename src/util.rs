@@ -258,8 +258,9 @@ macro_rules! log {
     };
 }
 
-/// Where log lines go: stdout, or the file named by SOLO45_LOG_FILE (the Umbrel app's data folder), which is
-/// rotated at 20 MB keeping three old copies (pool.log.1 .. pool.log.3), like pool.py's log.
+/// Where log lines go: always stdout (the container log, which umbrelOS shows as the app's logs), and also the file
+/// named by SOLO45_LOG_FILE (the Umbrel app's data folder), which is rotated at 20 MB keeping three old copies
+/// (pool.log.1 .. pool.log.3), like pool.py's log.
 struct LogFile {
     path: String,
     file: Option<std::fs::File>,
@@ -277,10 +278,9 @@ pub fn log_to_file(path: &str) {
 pub fn log_line(line: &str) {
     use std::io::Write;
     let mut g = LOG.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(l) = g.as_mut() else {
-        println!("{}", line);
-        return;
-    };
+    // every line goes to stdout too (under the lock, so lines stay in order); a closed stdout is ignored, never fatal
+    let _ = writeln!(std::io::stdout(), "{}", line);
+    let Some(l) = g.as_mut() else { return };
     if l.size + line.len() as u64 + 1 > LOG_MAX {
         l.file = None;
         for i in (1..3).rev() {
@@ -294,10 +294,7 @@ pub fn log_line(line: &str) {
     }
     match l.file.as_mut().map(|f| writeln!(f, "{}", line)) {
         Some(Ok(())) => l.size += line.len() as u64 + 1,
-        _ => {
-            println!("{}", line); // the data folder is unwritable: keep the line in the container log
-            l.file = None;
-        }
+        _ => l.file = None, // the data folder is unwritable: the line is still in the container log
     }
 }
 
