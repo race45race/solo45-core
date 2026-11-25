@@ -72,7 +72,7 @@ def find_block(c, job, en1, n):
 
 def main():
     os.makedirs(DATA, exist_ok=True)
-    for f in ("state.json", "pool.log", "blocks_found.jsonl"):
+    for f in ("state.json", "state.json.bak", "pool.log", "blocks_found.jsonl"):
         p = os.path.join(DATA, f)
         if os.path.exists(p):
             os.replace(p, p + ".old")

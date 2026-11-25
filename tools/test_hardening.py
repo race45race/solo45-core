@@ -161,7 +161,11 @@ def main():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), Proxy)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     addr_a = open(os.path.expanduser("~/solo45-test/core-regtest/address.txt")).read().strip()
+    cli("loadwallet", "core-test")  # an earlier test may have restarted the node, which starts without its wallet
     addr_b, addr_c, addr_d = (cli("getnewaddress", "", "bech32") for _ in range(3))
+    if not (addr_b and addr_c and addr_d):
+        print("FAIL the test node's wallet gave no new addresses (run: bash tools/regtest.sh start)")
+        return 1
     spk_a, spk_b, spk_c = spk_of(addr_a), spk_of(addr_b), spk_of(addr_c)
     env = dict(os.environ, SOLO45_STRATUM_PORT=str(STRATUM), SOLO45_API_PORT=str(API), SOLO45_DATA_DIR=DATA,
                SOLO45_LOG_FILE=os.path.join(DATA, "pool.log"), SOLO45_DEFAULT_ADDRESS=addr_a,
