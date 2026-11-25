@@ -14,8 +14,8 @@
 
 use crate::job::Job;
 use crate::log;
-use crate::pool::{Ctl, NewJob, Payout, Pool, WorkerHandle, WorkerInfo};
-use crate::util::{fmt_diff, now_f, push, script_num, target_diff};
+use crate::pool::{Ctl, NewJob, Payout, Pool, WorkerHandle, WorkerInfo, MAX_DIFF};
+use crate::util::{fmt_diff, now_f, push, script_num, sig3, target_diff};
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -31,7 +31,6 @@ use stratum_apps::stratum_core::channels_sv2::{
         standard::StandardChannel,
         share_accounting::{ShareValidationError, ShareValidationResult},
     },
-    Vardiff, VardiffState,
 };
 use stratum_apps::stratum_core::common_messages_sv2::{Protocol, SetupConnectionErrorOwned, SetupConnectionSuccess};
 use stratum_apps::stratum_core::mining_sv2::{
@@ -184,13 +183,59 @@ enum Sub {
     Std(SubmitSharesStandardOwned),
 }
 
-/// Shares the reference vardiff needs before it may change a channel's difficulty (see Conn::vardiff).
-const VARDIFF_MIN_SHARES: u32 = 12;
+/// A channel's vardiff window: accepted shares and their work since `start`, and a change waiting for a second window.
+#[derive(Clone, Copy, Debug)]
+struct Vd {
+    start: f64,
+    count: u32,
+    work: f64,
+    pending: Option<(i32, f64)>,
+}
+
+impl Vd {
+    fn new(now: f64) -> Vd {
+        Vd { start: now, count: 0, work: 0.0, pending: None }
+    }
+}
+
+/// The Stratum V1 port's vardiff (stratum.rs, pool.py) for one SV2 channel, instead of the reference vardiff, which
+/// judged every minute after 12 shares (rejected ones too) and kept a channel's difficulty moving: judged after 40
+/// accepted shares or 10 minutes (or after 12 share intervals with no share at all, at least 3 minutes); changes under
+/// x1.5 are ignored; a change under x4 must show in two windows in a row (then the geometric mean of both is used).
+/// `diff` is the channel's difficulty now, `target_s` its seconds per share. Returns the new difficulty, if any.
+fn calm_vardiff(vd: &mut Vd, diff: f64, target_s: f64, now: f64, min_diff: f64) -> Option<f64> {
+    let elapsed = now - vd.start;
+    let far_too_high = vd.count == 0 && elapsed >= (12.0 * target_s).max(180.0);
+    if vd.count < 40 && elapsed < 600.0 && !far_too_high {
+        return None;
+    }
+    let mut ideal = if vd.count > 0 { vd.work * target_s / elapsed.max(1.0) } else { diff / 4.0 };
+    ideal = ideal.max(diff / 8.0).min(diff * 16.0);
+    ideal = sig3(ideal).max(min_diff).min(MAX_DIFF);
+    *vd = Vd { start: now, count: 0, work: 0.0, pending: vd.pending };
+    let ratio = ideal / diff;
+    if 1.0 / 1.5 < ratio && ratio < 1.5 {
+        vd.pending = None;
+        return None;
+    }
+    let direction = if ideal > diff { 1 } else { -1 };
+    if !(far_too_high || ideal >= diff * 4.0 || ideal <= diff / 4.0) {
+        match vd.pending {
+            Some((d, prev)) if d == direction => ideal = sig3((ideal * prev).sqrt()),
+            _ => {
+                vd.pending = Some((direction, ideal));
+                return None;
+            }
+        }
+    }
+    vd.pending = None;
+    Some(ideal)
+}
 
 /// One channel on a connection: the reference channel state plus the miner as the pool shows it.
 struct Chan {
     ch: Ch,
-    vardiff: VardiffState,
+    vd: Vd, // vardiff window (calm_vardiff)
     worker_id: u64,
     info: Arc<Mutex<WorkerInfo>>,
     name: String,
@@ -344,6 +389,7 @@ impl Conn {
                 if on!(&mut c.ch, x => x.update_channel(u.nominal_hash_rate, Some(max)).is_ok()) {
                     let t = *on!(&c.ch, x => x.get_target());
                     c.info.lock().unwrap().diff = t.difficulty_float();
+                    c.vd = Vd::new(now_f());
                     let id = u.channel_id;
                     self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id: id, target: t.to_le_bytes().into() })).await?;
                 }
@@ -471,8 +517,7 @@ impl Conn {
                     }
                 });
                 self.pool.workers.lock().unwrap().insert(worker_id, WorkerHandle { info: info.clone(), ctl: ctl_tx });
-                let vardiff = VardiffState::new().map_err(|e| anyhow!("vardiff: {:?}", e))?;
-                self.chans.insert(channel_id, Chan { ch, vardiff, worker_id, info, name: name.clone(), address: address.clone(), spk,
+                self.chans.insert(channel_id, Chan { ch, vd: Vd::new(now_f()), worker_id, info, name: name.clone(), address: address.clone(), spk,
                                                      tip: String::new(), fixed: fixed_diff.is_some(), job_diff: HashMap::new(),
                                                      early: (now_f(), 0, 0.0) });
                 log!("INFO", "authorized {} {} ({}, Stratum V2 {} channel {}) pays {}, difficulty {}{}", self.ip, name, self.agent, kind,
@@ -563,7 +608,6 @@ impl Conn {
         let Some(c) = self.chans.get_mut(&channel_id) else {
             return self.send_mining(MiningOwned::SubmitSharesError(bad_channel)).await;
         };
-        c.vardiff.increment_shares_since_last_update();
         let now_diff = on!(&c.ch, x => x.get_target().difficulty_float());
         let credit = c.job_diff.get(&job_id).map_or(now_diff, |d| d.min(now_diff));
         let res = match (&mut c.ch, sub) {
@@ -581,6 +625,7 @@ impl Conn {
             Ok(ShareValidationResult::Valid(hash)) => {
                 let share_diff = hash_diff(hash.as_ref());
                 self.credit(channel_id, credit, share_diff, now, false);
+                self.count_share(channel_id, credit);
                 let m = ok(&self.chans[&channel_id]);
                 self.send_mining(MiningOwned::SubmitSharesSuccess(m)).await?;
                 self.early_retarget(channel_id, credit, now).await
@@ -588,6 +633,7 @@ impl Conn {
             Ok(ShareValidationResult::BlockFound(hash, template_id, coinbase)) => {
                 let share_diff = hash_diff(hash.as_ref());
                 self.credit(channel_id, credit, share_diff, now, true);
+                self.count_share(channel_id, credit);
                 let c = &self.chans[&channel_id];
                 let (name, address) = (c.name.clone(), c.address.clone());
                 let job = template_id.and_then(|t| self.pool.job(&format!("{:x}", t)));
@@ -624,6 +670,14 @@ impl Conn {
         }
     }
 
+    /// An accepted share for the channel's vardiff window.
+    fn count_share(&mut self, channel_id: u32, credit: f64) {
+        if let Some(c) = self.chans.get_mut(&channel_id) {
+            c.vd.count += 1;
+            c.vd.work += credit;
+        }
+    }
+
     fn credit(&self, channel_id: u32, credit: f64, share_diff: f64, now: f64, block: bool) {
         let c = &self.chans[&channel_id];
         {
@@ -650,7 +704,6 @@ impl Conn {
         self.pool.share_accepted(&c.name, credit, share_diff, now, block);
     }
 
-    /// Every minute: the reference vardiff per channel; a new target goes to the miner with SetTarget.
     /// A difficulty from the API (a per-miner override set, or removed: then the miner's current difficulty comes back
     /// and vardiff takes over again). Sent to the miner with SetTarget.
     async fn set_difficulty(&mut self, channel_id: u32, diff: f64) -> Result<()> {
@@ -664,6 +717,7 @@ impl Conn {
         }
         let t = *on!(&c.ch, x => x.get_target());
         c.info.lock().unwrap().diff = t.difficulty_float();
+        c.vd = Vd::new(now_f());
         log!("INFO", "{} difficulty set to {} (Stratum V2{})", c.name, fmt_diff(t.difficulty_float()), if c.fixed { ", fixed" } else { "" });
         self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id, target: t.to_le_bytes().into() })).await
     }
@@ -693,36 +747,31 @@ impl Conn {
         Ok(())
     }
 
+    /// Every minute: calm_vardiff per channel; a new difficulty goes to the miner with SetTarget.
     async fn vardiff(&mut self) -> Result<()> {
         let mut out = Vec::new();
-        let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let now = now_f();
+        let min_diff = self.pool.cfg.min_diff;
         for (id, c) in self.chans.iter_mut() {
             if c.fixed {
                 continue; // a fixed difficulty from the API
             }
-            // the reference vardiff judges every minute; at one share per ~10 s a single quiet minute (0 shares,
-            // about 1 minute in 400) divides the difficulty by 3 and the next ones overshoot. Let it judge only once
-            // there are VARDIFF_MIN_SHARES shares to go on, after 5 minutes, or after 2 minutes with no share at all (a
-            // difficulty far too hard: by chance that's about 1 in 160,000 at one share per 10 s, so it steps down
-            // every 2 minutes instead of every 5). A flood of shares is handled at once by early_retarget.
-            let since = now_s.saturating_sub(c.vardiff.timestamp_of_last_update);
-            let shares = c.vardiff.shares_since_last_update;
-            if shares < VARDIFF_MIN_SHARES && since < 300 && !(shares == 0 && since >= 120) {
-                continue;
-            }
-            let (h, t, spm) = on!(&c.ch, x => (x.get_nominal_hashrate(), *x.get_target(), x.get_shares_per_minute()));
-            let Ok(Some(new_h)) = c.vardiff.try_vardiff(h, &t, spm) else {
+            let (spm, diff) = on!(&c.ch, x => (x.get_shares_per_minute() as f64, x.get_target().difficulty_float()));
+            let Some(want) = calm_vardiff(&mut c.vd, diff, 60.0 / spm.max(0.01), now, min_diff) else {
                 on!(&mut c.ch, x => x.set_stable_hashrate(true));
                 continue;
             };
             on!(&mut c.ch, x => x.set_stable_hashrate(false));
-            if on!(&mut c.ch, x => x.update_channel(new_h, None).is_ok()) {
+            let h = (want * 4_294_967_296.0 * spm / 60.0) as f32;
+            if on!(&mut c.ch, x => x.update_channel(h, None).is_ok()) {
                 let t = *on!(&c.ch, x => x.get_target());
                 let d = t.difficulty_float();
                 let old = c.info.lock().unwrap().diff;
                 c.info.lock().unwrap().diff = d;
-                log!("INFO", "{} difficulty {} -> {} (Stratum V2)", c.name, crate::util::fmt_diff(old), crate::util::fmt_diff(d));
+                log!("INFO", "{} difficulty {} -> {} (Stratum V2)", c.name, fmt_diff(old), fmt_diff(d));
                 out.push(SetTargetOwned { channel_id: *id, target: t.to_le_bytes().into() });
+            } else {
+                log!("WARNING", "{} (Stratum V2): difficulty {} is outside what the miner allows", c.name, fmt_diff(want));
             }
         }
         for m in out {
@@ -942,6 +991,62 @@ pub fn legacy_coinbase(cb: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{calm_vardiff, Vd};
+
+    /// A window of `n` accepted shares at difficulty `d` (credit = d each).
+    fn window(vd: &mut Vd, n: u32, d: f64) {
+        vd.count = n;
+        vd.work = n as f64 * d;
+    }
+
+    #[test]
+    fn calm_vardiff_like_v1() {
+        // 12 s per share at difficulty 500K
+        let (d, s) = (500_000.0, 12.0);
+        // too early: 20 shares in 4 minutes
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 20, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 240.0, 1.0), None);
+        // 40 shares right on the share rate (480 s): no change
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 480.0, 1.0), None);
+        // 40 shares 1.3x too fast: ignored (under x1.5), window restarted
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 480.0 / 1.3, 1.0), None);
+        assert_eq!((vd.count, vd.pending), (0, None));
+        // 2x too fast: only a second window in the same direction changes it (geometric mean of both)
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 240.0, 1.0), None);
+        assert_eq!(vd.pending, Some((1, 1_000_000.0)));
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 240.0 + 240.0, 1.0), Some(1_000_000.0));
+        assert_eq!(vd.pending, None);
+        // 2x too fast, then 2x too slow: the windows disagree, no change
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 240.0, 1.0), None);
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 240.0 + 960.0, 1.0), None);
+        assert_eq!(vd.pending, Some((-1, 250_000.0)));
+        // 5x too fast: at once
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 40, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 96.0, 1.0), Some(2_500_000.0));
+        // no share for 3 minutes (12 x 12 s = 144 s, at least 180 s): a quarter, at once
+        let mut vd = Vd::new(0.0);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 179.0, 1.0), None);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 180.0, 1.0), Some(125_000.0));
+        // 10 minutes with few shares still judges: 10 shares in 600 s = 1 per 60 s, x5 too slow -> 100K at once
+        let mut vd = Vd::new(0.0);
+        window(&mut vd, 10, d);
+        assert_eq!(calm_vardiff(&mut vd, d, s, 600.0, 1.0), Some(100_000.0));
+        // never below the pool's minimum
+        let mut vd = Vd::new(0.0);
+        assert_eq!(calm_vardiff(&mut vd, 2.0, s, 600.0, 1.0), Some(1.0));
+    }
     #[test]
     fn base58check_matches_the_reference_key_format() {
         // vectors checked with an independent (Python) Base58Check; the reference key_utils reads ours back
