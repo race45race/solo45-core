@@ -41,6 +41,8 @@ jobs:
         run: python3 tools/test_node_reject.py
       - name: A found block survives Core stopping while it sends it
         run: python3 tools/test_resume_block.py
+      - name: Payout change on Stratum V1, a node that can't answer, a block resent for as long as it takes, state.json backup
+        run: python3 tools/test_hardening.py
       - name: Stall guard
         run: python3 tools/test_stallguard.py
       - name: Stratum V2 extended channels through the Translator Proxy
@@ -57,6 +59,7 @@ jobs:
         if: always()
         run: |
           for f in ~/solo45-test/core-regtest/pool.log ~/solo45-test/core-reject/pool.log ~/solo45-test/core-stallguard/pool.log \
+                   ~/solo45-test/core-hardening/pool.log \
                    ~/solo45-test/core-sv2/pool.log ~/solo45-test/core-sv2/tproxy.log; do
             echo "== $f"; tail -n 40 "$f" 2>/dev/null || true
           done

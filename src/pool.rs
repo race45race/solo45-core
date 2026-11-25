@@ -28,12 +28,15 @@ pub const AUTH_WINDOW_S: f64 = 120.0;
 pub const SPK_CACHE_MAX: usize = 5000;
 pub const MAX_AUTHORIZE: u32 = 10;
 /// A found block goes to the node again while it can't be reached or is still starting: every SUBMIT_RETRY_S for the
-/// first SUBMIT_TRIES tries, then every SUBMIT_SLOW_S, until SUBMIT_GIVE_UP_S (a node restart can take minutes; after
-/// ~10 minutes the next block has usually been found). The node's own verdict ends it at once.
+/// first SUBMIT_TRIES tries, then every SUBMIT_SLOW_S, and after SUBMIT_SLOWER_AFTER_S every SUBMIT_IDLE_S for as long
+/// as it takes (a node restart can take many minutes, and about one time in three the network has not found the next
+/// block 10 minutes later, so the block can still count). Only the node's own verdict ends it; until then the block
+/// stays saved as "sending", so a restart of the pool sends it again too.
 pub const SUBMIT_TRIES: u32 = 6;
 pub const SUBMIT_RETRY_S: f64 = 2.0;
 pub const SUBMIT_SLOW_S: f64 = 5.0;
-pub const SUBMIT_GIVE_UP_S: f64 = 600.0;
+pub const SUBMIT_SLOWER_AFTER_S: f64 = 600.0;
+pub const SUBMIT_IDLE_S: f64 = 30.0;
 pub const MAX_JOBS: usize = 40;
 
 /// Stand-in payout script for block checks before any payout address is known.
@@ -69,6 +72,8 @@ pub struct Config {
     pub empty_hold_s: f64,
     pub template_refresh_s: f64,
     pub stall_guard_s: f64,
+    /// how long a found block is resent every SUBMIT_SLOW_S before the tries drop to every SUBMIT_IDLE_S
+    pub submit_slower_after_s: f64,
     pub data_dir: String,
 }
 
@@ -104,9 +109,80 @@ impl Config {
             empty_hold_s: env("SOLO45_EMPTY_HOLD_S", 10.0),
             template_refresh_s: env("SOLO45_TEMPLATE_REFRESH_S", 30.0),
             stall_guard_s: env("SOLO45_STALL_GUARD_S", 60.0), // 0 = off
+            submit_slower_after_s: env("SOLO45_SUBMIT_SLOWER_AFTER_S", SUBMIT_SLOWER_AFTER_S), // tests shorten it
             data_dir: shellexpand(&env("SOLO45_DATA_DIR", ".".to_string())),
         }
     }
+}
+
+/// The node's answer about an address (Pool::lookup_script).
+pub enum Lookup {
+    Script(Vec<u8>),
+    Invalid,
+    /// the node couldn't be asked (down, starting, too slow)
+    NoAnswer,
+}
+
+/// Where a miner's blocks are paid (Pool::payout_for).
+pub enum Payout {
+    To(String, Vec<u8>),
+    /// no payout address is set and the username has none
+    NoAddress,
+    /// the username may hold the miner's own address, but the node can't check it right now
+    NoAnswer,
+}
+
+/// state.json as last saved. When it can't be read: the unreadable file is kept as state.json.bad-<time>, and its
+/// backup state.json.bak (written every 10 minutes) is used. Returns (state, new install); with neither file readable
+/// the pool starts like a new install, loudly.
+fn load_state(path: &str) -> (Value, bool) {
+    let bak = format!("{}.bak", path);
+    let exists = |p: &str| std::path::Path::new(p).exists();
+    let read = |p: &str| -> std::result::Result<Value, String> {
+        let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.is_object() => Ok(v),
+            Ok(_) => Err("it doesn't hold the pool's settings".to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if !exists(path) && !exists(&bak) {
+        return (json!({}), true);
+    }
+    let why = match read(path) {
+        Ok(v) => return (v, false),
+        Err(e) => if exists(path) { e } else { "it is missing".to_string() },
+    };
+    let mut kept = String::new();
+    if exists(path) {
+        let aside = format!("{}.bad-{}", path, now_f() as u64);
+        if std::fs::rename(path, &aside).is_ok() {
+            kept = format!("; the unreadable file is kept as {}", aside);
+        }
+    }
+    match read(&bak) {
+        Ok(v) => {
+            log!("ERROR", "state.json can't be read ({}): using its backup state.json.bak (a setting changed in the last \
+                           10 minutes may be missing: check the Settings tab){}", why, kept);
+            (v, false)
+        }
+        Err(e) => {
+            log!("ERROR", "state.json can't be read ({}) and neither can its backup ({}): starting like a new install. \
+                           Enter the payout address again; per-miner settings and best shares are gone{}", why, e, kept);
+            (json!({}), true)
+        }
+    }
+}
+
+/// Write a file so that a crash or power cut leaves either the old or the new contents: a temporary file, flushed to
+/// the disk, then renamed over the old one.
+fn write_synced(path: &str, body: &str) -> std::io::Result<()> {
+    let tmp = format!("{}.tmp", path);
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 #[derive(Clone)]
@@ -372,6 +448,8 @@ pub struct Pool {
     pub stats: Mutex<Stats>,
     pub state: Mutex<Value>,
     state_path: String,
+    /// one save at a time (they share a temporary file); holds when state.json.bak was last written
+    save: Mutex<Option<Instant>>,
     pub submitting: AtomicUsize,
     tpl: tokio::sync::Mutex<TplState>,
     chain: RwLock<Option<String>>,
@@ -395,9 +473,7 @@ impl Pool {
         let seed = (now_f() * 1e6) as u64;
         std::fs::create_dir_all(&cfg.data_dir).ok();
         let state_path = format!("{}/state.json", cfg.data_dir);
-        let new_install = !std::path::Path::new(&state_path).exists();
-        let mut state: Value = std::fs::read_to_string(&state_path).ok()
-            .and_then(|s| serde_json::from_str(&s).ok()).filter(|v: &Value| v.is_object()).unwrap_or(json!({}));
+        let (mut state, new_install) = load_state(&state_path);
         for (k, d) in [("best_ever", json!({"diff": 0.0})), ("blocks", json!([])), ("accepted_total", json!(0)),
                        ("overrides", json!({})), ("settings", json!({})), ("last_diff", json!({}))] {
             if state.get(k).is_none() {
@@ -405,7 +481,8 @@ impl Pool {
             }
         }
         if new_install {
-            // a new install pays every miner to the payout address; older ones keep what they had
+            // a new install (or one whose saved state is lost) pays every miner to the payout address; older ones keep
+            // what they had
             state["settings"]["force_default_address"] = json!(true);
         }
         let default = (cfg.default_address.clone(), None);
@@ -434,6 +511,7 @@ impl Pool {
             stats: Mutex::new(Stats { best: json!({"diff": 0.0}), proposal: json!({"ok": null}), ..Default::default() }),
             state: Mutex::new(state),
             state_path,
+            save: Mutex::new(None),
             submitting: AtomicUsize::new(0),
             tpl: tokio::sync::Mutex::new(TplState::default()),
             chain: RwLock::new(None),
@@ -552,15 +630,25 @@ impl Pool {
     // ------------------------------------------------------------------ payouts
 
     /// The node's output script for an address, or None (not an address, invalid, or the node can't be asked).
-    /// Junk usernames cost nothing and the cache keeps at most SPK_CACHE_MAX entries (v0.1.65 hardening).
     pub async fn script_for(&self, address: &str) -> Option<Vec<u8>> {
+        match self.lookup_script(address).await {
+            Lookup::Script(s) => Some(s),
+            Lookup::Invalid | Lookup::NoAnswer => None,
+        }
+    }
+
+    /// What the node says about an address: its output script, not a valid address, or no answer (the node is down,
+    /// starting or too slow), which is kept apart so "couldn't ask" is never taken for "isn't an address".
+    /// Junk usernames cost nothing and the cache keeps at most SPK_CACHE_MAX entries (v0.1.65 hardening).
+    pub async fn lookup_script(&self, address: &str) -> Lookup {
+        let known = |v: Option<Vec<u8>>| v.map_or(Lookup::Invalid, Lookup::Script);
         if !address_plausible(address) {
-            return None;
+            return Lookup::Invalid;
         }
         if let Some(v) = self.spk_cache.lock().unwrap().0.get(address) {
-            return v.clone();
+            return known(v.clone());
         }
-        let r = self.rpc.call("validateaddress", json!([address])).await.ok()?;
+        let Ok(r) = self.rpc.call("validateaddress", json!([address])).await else { return Lookup::NoAnswer };
         let spk = if r["isvalid"].as_bool() == Some(true) {
             r["scriptPubKey"].as_str().and_then(|s| hex::decode(s).ok())
         } else {
@@ -575,20 +663,26 @@ impl Pool {
         if c.0.insert(address.to_string(), spk.clone()).is_none() {
             c.1.push_back(address.to_string());
         }
-        spk
+        known(spk)
     }
 
-    /// (address, script) a miner with this username pays: the payout address when "Always pay my address" is on,
-    /// else a valid address at the start of the username, else the payout address. None if neither works.
-    pub async fn payout_for(&self, user: &str) -> Option<(String, Vec<u8>)> {
+    /// The (address, script) a miner with this username pays: the payout address when "Always pay my address" is on,
+    /// else a valid address at the start of the username, else the payout address. NoAddress if neither works.
+    /// NoAnswer when the username starts with what may be the miner's own address but the node can't say right now:
+    /// the miner is then refused (it tries again) instead of being paid to the payout address by mistake.
+    pub async fn payout_for(&self, user: &str) -> Payout {
         let address = user.split('.').next().unwrap_or("");
-        let spk = if self.pays_default() { None } else { self.script_for(address).await };
-        match spk {
-            Some(s) => Some((address.to_string(), s)),
-            None => {
-                let d = self.default.read().unwrap().clone();
-                d.1.map(|s| (d.0, s))
+        if !self.pays_default() {
+            match self.lookup_script(address).await {
+                Lookup::Script(s) => return Payout::To(address.to_string(), s),
+                Lookup::NoAnswer => return Payout::NoAnswer,
+                Lookup::Invalid => {}
             }
+        }
+        let d = self.default.read().unwrap().clone();
+        match d.1 {
+            Some(s) => Payout::To(d.0, s),
+            None => Payout::NoAddress,
         }
     }
 
@@ -975,8 +1069,8 @@ impl Pool {
         }
     }
 
-    /// Save, then submit a found block: tries again while the node can't be reached or is starting (see SUBMIT_GIVE_UP_S);
-    /// the node's own verdict ends it. "duplicate" after a resend means an earlier try got through.
+    /// Save, then submit a found block: tries again for as long as the node can't be reached or is starting (see
+    /// SUBMIT_TRIES); the node's own verdict ends it. "duplicate" after a resend means an earlier try got through.
     pub async fn found_block(self: Arc<Self>, worker: String, ip: String, address: String, job: Arc<Job>,
                              header: [u8; 80], coinbase: Vec<u8>, share_diff: f64) {
         let block_hex = hex::encode(job.block(&header, &coinbase));
@@ -993,43 +1087,39 @@ impl Pool {
         self.submit_and_record(record, block_hex, false).await;
     }
 
-    /// Send a saved block to the node until it answers (see SUBMIT_GIVE_UP_S), then record the answer: in
-    /// blocks_found.jsonl, the API's block list, and a fresh job. `resent`: it may have reached the node before (a
-    /// block resumed after a restart), so "duplicate" means it got there.
+    /// Send a saved block to the node until it answers (however long that takes, see SUBMIT_TRIES), then record the
+    /// answer: in blocks_found.jsonl, the API's block list, and a fresh job. `resent`: it may have reached the node
+    /// before (a block resumed after a restart), so "duplicate" means it got there.
     async fn submit_and_record(self: Arc<Self>, mut record: Value, block_hex: String, mut resent: bool) {
         let hash = record["hash"].as_str().unwrap_or("").to_string();
         self.submitting.fetch_add(1, Ordering::SeqCst);
-        let mut result: Value;
         let t0 = Instant::now();
+        let mut last_log = Instant::now();
         let mut attempt = 0u32;
-        loop {
+        let mut result: Value = loop {
             attempt += 1;
             match self.rpc.call_t("submitblock", json!([block_hex]), 60).await {
-                Ok(v) => {
-                    result = v;
-                    break;
-                }
+                Ok(v) => break v,
                 Err(e) => {
                     let msg = e.to_string();
-                    result = json!(format!("error: {}", msg));
                     let warming = msg.contains("-28");
                     if msg.contains("RPC submitblock error") && !warming {
-                        break; // the node's own answer: sending it again won't change it
+                        break json!(format!("error: {}", msg)); // the node's own answer: sending it again won't change it
                     }
+                    // the node can't be reached or is still starting: never give up on a block (it stays "sending" in
+                    // blocks_found.jsonl, so a restart of the pool resends it as well)
                     resent = true;
-                    let more = t0.elapsed().as_secs_f64() < SUBMIT_GIVE_UP_S;
-                    if attempt <= SUBMIT_TRIES || attempt % 12 == 0 || !more { // every try at first, then about once a minute
-                        log!("CRITICAL", "submitblock {}, try {} failed: {}{}", hash, attempt, msg,
-                            if more { "; trying again" } else { "; giving up after 10 minutes (the block is saved in blocks_found.jsonl)" });
+                    let slow = t0.elapsed().as_secs_f64() >= self.cfg.submit_slower_after_s;
+                    // every try at first, then about once a minute, later every 10 minutes
+                    if attempt <= SUBMIT_TRIES || last_log.elapsed().as_secs_f64() >= if slow { 600.0 } else { 60.0 } {
+                        last_log = Instant::now();
+                        log!("CRITICAL", "submitblock {}, try {} failed: {}; trying again until the node answers", hash, attempt, msg);
                     }
-                    if !more {
-                        break;
-                    }
-                    let gap = if attempt < SUBMIT_TRIES { SUBMIT_RETRY_S } else { SUBMIT_SLOW_S };
+                    let gap = if attempt < SUBMIT_TRIES { SUBMIT_RETRY_S } else if slow { SUBMIT_IDLE_S } else { SUBMIT_SLOW_S };
                     tokio::time::sleep(Duration::from_secs_f64(gap)).await;
                 }
             }
-        }
+        };
         self.submitting.fetch_sub(1, Ordering::SeqCst);
         if result == json!("duplicate") && resent {
             log!("CRITICAL", "submitblock {}: the node already had it from an earlier try", hash);
@@ -1086,8 +1176,8 @@ impl Pool {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     }
-    /// At start: a block saved as "sending" whose answer never came (Core stopped while sending it, or gave up while
-    /// the node was down) goes to the node again if it can still count: it is for the next block, or the node's
+    /// At start: a block saved as "sending" whose answer never came (the pool stopped while it was still sending it,
+    /// for example during a long node restart) goes to the node again if it can still count: it is for the next block, or the node's
     /// newest block (it may already have it: then "duplicate" = it got there). Older ones are recorded as stale, so
     /// they aren't looked at again.
     async fn resume_unsent(self: Arc<Self>) {
@@ -1447,11 +1537,17 @@ impl Pool {
         s.window_best = (0.0, String::new());
     }
 
+    /// Save state.json (one save at a time, flushed to the disk before it replaces the old file), and every 10 minutes
+    /// the same contents as state.json.bak, which load_state falls back on.
     pub fn save_state(&self) -> std::io::Result<()> {
+        let mut last_bak = self.save.lock().unwrap_or_else(|e| e.into_inner());
         let body = self.state.lock().unwrap().to_string();
-        let tmp = format!("{}.tmp", self.state_path);
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &self.state_path)
+        write_synced(&self.state_path, &body)?;
+        if last_bak.map_or(true, |t| t.elapsed() >= Duration::from_secs(600)) {
+            write_synced(&format!("{}.bak", self.state_path), &body)?;
+            *last_bak = Some(Instant::now());
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ start and stop
@@ -1946,7 +2042,8 @@ impl Pool {
             .map(|h| (h.info.clone(), h.info.lock().unwrap().user.clone())).collect();
         let mut changed = 0;
         for (info, user) in list {
-            if let Some((address, spk)) = self.payout_for(&user).await {
+            // a miner whose own address the node can't check right now keeps what it pays
+            if let Payout::To(address, spk) = self.payout_for(&user).await {
                 let mut i = info.lock().unwrap();
                 if spk != i.spk {
                     i.address = address;
@@ -2026,5 +2123,38 @@ mod tests {
         // the first block of a difficulty period can't copy the bits
         let hdr2 = json!({"height": 2016 * 485 - 1, "hash": "00", "bits": "17023a04", "mediantime": 1});
         assert!(empty_template(&hdr2, 0x20000000, 0.0).is_none());
+    }
+
+    #[test]
+    fn state_file_falls_back_on_its_backup() {
+        let dir = std::env::temp_dir().join(format!("s45-state-test-{}-{}", std::process::id(), (now_f() * 1e6) as u64));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json").to_string_lossy().into_owned();
+        let bad_copies = || std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".bad-")).count();
+        // nothing saved yet: a new install
+        let (v, new) = load_state(&path);
+        assert!(new && v == json!({}));
+        // a good file is used as it is
+        write_synced(&path, r#"{"settings":{"default_address":"a"}}"#).unwrap();
+        let (v, new) = load_state(&path);
+        assert!(!new && v["settings"]["default_address"] == "a");
+        // an unreadable file (cut short, empty, or not an object): the backup is used and the bad file is kept
+        write_synced(&format!("{}.bak", path), r#"{"settings":{"default_address":"b"}}"#).unwrap();
+        for (n, bad) in [r#"{"settings":{"defau"#, "", "[1,2]"].iter().enumerate() {
+            std::fs::write(&path, bad).unwrap();
+            let (v, new) = load_state(&path);
+            assert!(!new && v["settings"]["default_address"] == "b", "{:?}", bad);
+            assert!(!std::path::Path::new(&path).exists());
+            assert!(bad_copies() >= 1, "kept copy {}", n);
+        }
+        // the file is missing but the backup is there: not a new install
+        let (v, new) = load_state(&path);
+        assert!(!new && v["settings"]["default_address"] == "b");
+        // neither can be read: like a new install (which turns "always pay my address" on)
+        std::fs::write(&path, "garbage").unwrap();
+        std::fs::write(format!("{}.bak", path), "garbage").unwrap();
+        let (v, new) = load_state(&path);
+        assert!(new && v == json!({}));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

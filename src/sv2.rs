@@ -14,7 +14,7 @@
 
 use crate::job::Job;
 use crate::log;
-use crate::pool::{Ctl, NewJob, Pool, WorkerHandle, WorkerInfo};
+use crate::pool::{Ctl, NewJob, Payout, Pool, WorkerHandle, WorkerInfo};
 use crate::util::{fmt_diff, now_f, push, script_num, target_diff};
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -370,9 +370,17 @@ impl Conn {
         if self.chans.len() >= MAX_CHANNELS_PER_CONN {
             return self.send_mining(refuse("max-channels-reached")).await;
         }
-        let Some((address, spk)) = self.pool.payout_for(&user).await else {
-            log!("INFO", "refused {} {} (Stratum V2): no payout address yet", self.ip, user);
-            return self.send_mining(refuse("unknown-user")).await;
+        let (address, spk) = match self.pool.payout_for(&user).await {
+            Payout::To(address, spk) => (address, spk),
+            Payout::NoAddress => {
+                log!("INFO", "refused {} {} (Stratum V2): no payout address yet", self.ip, user);
+                return self.send_mining(refuse("unknown-user")).await;
+            }
+            Payout::NoAnswer => {
+                log!("INFO", "refused {} {} (Stratum V2) for now: the node can't check the address in its username (down, \
+                              starting or slow); the miner will try again", self.ip, user);
+                return self.send_mining(refuse("unknown-user")).await;
+            }
         };
         let allocated = {
             let mut a = self.sv2.allocator.lock().unwrap();

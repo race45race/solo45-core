@@ -4,7 +4,7 @@
 
 use crate::job::{Job, EN2_SIZE};
 use crate::log;
-use crate::pool::{Ctl, Pool, WorkerHandle, WorkerInfo, AUTH_WINDOW_S, MAX_AUTHORIZE, MAX_DIFF, VERSION_MASK};
+use crate::pool::{Ctl, Payout, Pool, WorkerHandle, WorkerInfo, AUTH_WINDOW_S, MAX_AUTHORIZE, MAX_DIFF, VERSION_MASK};
 use crate::util::{fmt_diff, g3, hash_diff, hash_meets, now_f, sha256d, sig3};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -28,6 +28,16 @@ fn err(code: i64, msg: &'static str) -> StratumError {
     StratumError { code, msg }
 }
 
+/// What a job went out to this miner with: its difficulty and the payout its coinbase carries. A share is checked
+/// against these, not against the miner's current ones: after a payout address change the miner is still hashing
+/// the older job's coinbase until the new job reaches it, and such a share (or a block) must still count. A block
+/// found on the older job pays the address that job carried, as on Stratum V2.
+struct Sent {
+    diff: f64,
+    spk: Vec<u8>,
+    address: String,
+}
+
 struct Worker {
     pool: Arc<Pool>,
     id: u64,
@@ -39,7 +49,7 @@ struct Worker {
     remembered: bool,
     switches_at_once: bool,
     vd_pending: Option<(i32, f64)>,
-    job_diff: HashMap<String, f64>,
+    job_sent: HashMap<String, Sent>,
     authorized: bool,
     auth_tries: u32,
     name: String,
@@ -76,7 +86,7 @@ pub async fn serve(pool: Arc<Pool>, stream: TcpStream, peer: SocketAddr) {
         remembered: false,
         switches_at_once: false,
         vd_pending: None,
-        job_diff: HashMap::new(),
+        job_sent: HashMap::new(),
         authorized: false,
         auth_tries: 0,
         name: String::new(),
@@ -179,15 +189,18 @@ impl Worker {
         self.send(&json!({"id": null, "method": "mining.set_difficulty", "params": [d]})).await
     }
 
-    fn spk(&self) -> Vec<u8> {
-        self.info.lock().unwrap().spk.clone()
+    /// The (script, address) this miner pays right now.
+    fn payout(&self) -> (Vec<u8>, String) {
+        let i = self.info.lock().unwrap();
+        (i.spk.clone(), i.address.clone())
     }
 
     async fn send_job(&mut self, job: &Arc<Job>, clean: bool) -> std::io::Result<()> {
-        self.job_diff.insert(job.id.clone(), self.diff);
+        let (spk, address) = self.payout();
+        let params = job.notify_params(&spk, clean);
+        self.job_sent.insert(job.id.clone(), Sent { diff: self.diff, spk, address });
         let pool = self.pool.clone();
-        self.job_diff.retain(|id, _| pool.job(id).is_some());
-        let params = job.notify_params(&self.spk(), clean);
+        self.job_sent.retain(|id, _| pool.job(id).is_some());
         self.send(&json!({"id": null, "method": "mining.notify", "params": params})).await
     }
 
@@ -278,9 +291,17 @@ impl Worker {
             None => return Err(err(20, "Bad request")),
         };
         let name = user.split_once('.').map(|(_, n)| n.to_string()).unwrap_or_default();
-        let Some((address, spk)) = self.pool.payout_for(&user).await else {
-            log!("INFO", "refused {} {}: no payout address yet (set one, or put an address in the miner's username)", self.ip, user);
-            return Ok((json!(false), After::None));
+        let (address, spk) = match self.pool.payout_for(&user).await {
+            Payout::To(address, spk) => (address, spk),
+            Payout::NoAddress => {
+                log!("INFO", "refused {} {}: no payout address yet (set one, or put an address in the miner's username)", self.ip, user);
+                return Ok((json!(false), After::None));
+            }
+            Payout::NoAnswer => {
+                log!("INFO", "refused {} {} for now: the node can't check the address in its username (down, starting or \
+                              slow); the miner will try again", self.ip, user);
+                return Ok((json!(false), After::None));
+            }
         };
         self.name = if name.is_empty() { self.ip.clone() } else { name };
         if let Some(d) = self.pool.remembered_diff(&self.name) {
@@ -369,9 +390,10 @@ impl Worker {
         if job.seen.lock().unwrap().contains(&key) {
             return Err(self.reject("duplicate", 22, "Duplicate share"));
         }
-        let (spk, address) = {
-            let i = self.info.lock().unwrap();
-            (i.spk.clone(), i.address.clone())
+        // the payout this job went out with (see Sent), not the miner's current one
+        let (spk, address) = match self.job_sent.get(&job.id) {
+            Some(s) => (s.spk.clone(), s.address.clone()),
+            None => self.payout(),
         };
         let mut coinbase = job.coinb1.clone();
         coinbase.extend_from_slice(&self.en1);
@@ -386,7 +408,7 @@ impl Worker {
             let pool = self.pool.clone();
             tokio::spawn(pool.found_block(self.name.clone(), self.ip.clone(), address, job.clone(), header, coinbase, share_diff));
         }
-        let required = self.job_diff.get(&job.id).copied().unwrap_or(self.diff).min(self.diff);
+        let required = self.job_sent.get(&job.id).map_or(self.diff, |s| s.diff).min(self.diff);
         if share_diff < required * (1.0 - 1e-9) {
             return Err(self.reject("low-diff", 23, "Low difficulty share"));
         }
@@ -418,7 +440,7 @@ impl Worker {
 
     /// The difficulty an accepted share counts at (see pool.py's share_credit).
     fn share_credit(&mut self, job_id: &str, share_diff: f64) -> f64 {
-        let job_diff = self.job_diff.get(job_id).copied().unwrap_or(self.diff);
+        let job_diff = self.job_sent.get(job_id).map_or(self.diff, |s| s.diff);
         if share_diff < job_diff * (1.0 - 1e-9) {
             self.switches_at_once = true;
         }
