@@ -112,7 +112,11 @@ def main():
               len(snph) >= 2 and snph[-1] == snph[0], snph)
         b = miner("refusedminer", 1, 30, b_out)
         b.wait()
-        h1 = int(cli("getblockcount"))
+        for _ in range(50):  # the miner quits right after its share; the block reaches the node a few ms later
+            h1 = int(cli("getblockcount"))
+            if h1 > h0:
+                break
+            time.sleep(0.1)
         check("the next SV2 share made a block", h1 == h0 + 1, f"{h0} -> {h1}")
         blk = json.loads(cli("getblock", cli("getblockhash", str(h1)), "2")) if h1 > h0 else {"tx": []}
         spk = json.loads(cli("getaddressinfo", addr))["scriptPubKey"]

@@ -298,6 +298,11 @@ async fn connection(pool: Arc<Pool>, sv2: Arc<Sv2>, stream: TcpStream, peer: Soc
     result
 }
 
+/// A connection that sends nothing for this long is closed (V1's rule).
+const IDLE_S: u64 = 900;
+/// A connection that opens no mining channel within this long is closed (V1 gives an unauthorized miner 2 minutes).
+const NO_CHANNEL_S: u64 = 120;
+
 impl Conn {
     async fn send(&mut self, m: AnyMessageOwned) -> Result<()> {
         let f = OutboundFrame::from_message(m).map_err(|e| anyhow!("encode: {:?}", e))?;
@@ -336,10 +341,12 @@ impl Conn {
         let mut jobs = self.pool.job_tx.subscribe();
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.tick().await;
+        let (started, mut last_rx) = (tokio::time::Instant::now(), tokio::time::Instant::now());
         loop {
             tokio::select! {
                 f = frx.recv() => {
                     let Some(mut f) = f else { return Ok(()) };
+                    last_rx = tokio::time::Instant::now();
                     let header = f.header();
                     let msg = match parse_message_frame_with_tlvs(header, f.payload(), &[]) {
                         Ok((m, _)) => m.into_owned(),
@@ -364,7 +371,16 @@ impl Conn {
                     }
                 }
                 Some((id, diff)) = ctl_rx.recv() => self.set_difficulty(id, diff).await?,
-                _ = tick.tick() => self.vardiff().await?,
+                _ = tick.tick() => {
+                    // like V1: 15 minutes of silence ends a connection, and one that opens no channel gets 2 minutes
+                    if last_rx.elapsed() >= Duration::from_secs(IDLE_S) {
+                        return Err(anyhow!("nothing heard for {} min", IDLE_S / 60));
+                    }
+                    if self.chans.is_empty() && started.elapsed() >= Duration::from_secs(NO_CHANNEL_S) {
+                        return Err(anyhow!("no channel opened in {} s", NO_CHANNEL_S));
+                    }
+                    self.vardiff().await?
+                }
             }
         }
     }
@@ -385,6 +401,12 @@ impl Conn {
             AnyMessageOwned::Mining(MiningOwned::SubmitSharesStandard(s)) => self.share(Sub::Std(s)).await,
             AnyMessageOwned::Mining(MiningOwned::UpdateChannel(u)) => {
                 let Some(c) = self.chans.get_mut(&u.channel_id) else { return Ok(()) };
+                if c.fixed {
+                    // a fixed difficulty from the API stays: repeat it instead of following the miner's hashrate
+                    let t = *on!(&c.ch, x => x.get_target());
+                    let id = u.channel_id;
+                    return self.send_mining(MiningOwned::SetTarget(SetTargetOwned { channel_id: id, target: t.to_le_bytes().into() })).await;
+                }
                 let max = Target::from_le_bytes(u.max_target.to_array());
                 if on!(&mut c.ch, x => x.update_channel(u.nominal_hash_rate, Some(max)).is_ok()) {
                     let t = *on!(&c.ch, x => x.get_target());
@@ -813,6 +835,8 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
     });
     let mut resume_at: Option<tokio::time::Instant> = None;
     let sticky = std::env::var("SOLO45_TEST_STICKY").map_or(false, |v| v == "1");
+    // SOLO45_TEST_NO_CHANNEL=1: set up the connection but never open a channel (tests: the pool closes it)
+    let no_channel = std::env::var("SOLO45_TEST_NO_CHANNEL").map_or(false, |v| v == "1");
     let send = |m: AnyMessageOwned| -> Result<OutboundFrame> { OutboundFrame::from_message(m).map_err(|e| anyhow!("{:?}", e)) };
     let s = |t: &str| -> Result<_> { t.to_string().try_into().map_err(|e| anyhow!("{:?}", e)) };
     let setup = SetupConnectionOwned { protocol: Protocol::MiningProtocol, min_version: 2, max_version: 2, flags: 0,
@@ -830,7 +854,8 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
     let (mut sent, mut seq) = (0u32, 0u32);
     let mut nonce_base = 0u32;
     loop {
-        let wait = resume_at.map_or(Duration::from_secs(30), |t| t.saturating_duration_since(tokio::time::Instant::now()));
+        let quiet = if no_channel || shares == 0 { 1800 } else { 30 }; // a listener may hear nothing for a long time
+        let wait = resume_at.map_or(Duration::from_secs(quiet), |t| t.saturating_duration_since(tokio::time::Instant::now()));
         let msg = match tokio::time::timeout(wait, msg_rx.recv()).await {
             Ok(Some(m)) => Some(m?),
             Ok(None) => return Err(anyhow!("connection closed")),
@@ -841,7 +866,11 @@ pub async fn test_miner(addr: &str, pubkey: &str, user: &str, shares: u32, pause
         match msg {
             AnyMessageOwned::Common(CommonMessagesOwned::SetupConnectionSuccess(m)) => {
                 println!("SetupConnectionSuccess version {} flags {:#x}", m.used_version, m.flags);
-                w.write_frame(send(AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannel(open.clone())))?).await.map_err(|e| anyhow!("{:?}", e))?;
+                if no_channel {
+                    println!("not opening a channel (SOLO45_TEST_NO_CHANNEL)");
+                } else {
+                    w.write_frame(send(AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannel(open.clone())))?).await.map_err(|e| anyhow!("{:?}", e))?;
+                }
             }
             AnyMessageOwned::Mining(MiningOwned::OpenStandardMiningChannelSuccess(m)) => {
                 channel = m.channel_id;

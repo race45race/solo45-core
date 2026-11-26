@@ -300,6 +300,9 @@ pub struct Upd {
     pub source: Option<String>,
     /// the empty hold just ended (or the empty job failed its check): send the full template now
     pub fill: bool,
+    /// a routine refresh whose template (in tpl) was fetched before taking the template lock, so a slow node
+    /// never makes a new block's work wait behind it
+    pub refresh: bool,
 }
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -744,6 +747,9 @@ impl Pool {
                 let tip = self.tip();
                 let same_tip = u.tpl.as_ref().map_or(false, |t| prev_of(t) == tip)
                     || u.new_tip.as_deref().map_or(false, |n| n == tip);
+                if u.refresh && holding {
+                    return Ok(()); // a routine refresh during the hold: the hold's end fetches its own template
+                }
                 if holding && same_tip {
                     // stay on the coinbase-only job, but keep the node's template for the end of the hold
                     if let Some(t) = u.tpl {
@@ -755,11 +761,15 @@ impl Pool {
                 if holding && u.tpl.is_none() && u.new_tip.is_none() {
                     return Ok(()); // a routine refresh during the hold
                 }
-                if same_tip && !empty {
+                if same_tip && !empty && !u.refresh {
                     return Ok(()); // the other block watcher got there first
                 }
                 let mut clean = u.clean;
                 let mut tpl = u.tpl;
+                if u.refresh && !same_tip {
+                    // the tip moved while the node built this refresh: never mine on an old tip, build it again here
+                    tpl = None;
+                }
                 if u.fill {
                     if let Some(c) = &cur {
                         clean = true; // the hold is over: every miner leaves the empty job now
@@ -771,7 +781,7 @@ impl Pool {
                 st.held = None;
                 st.held_at = 0.0;
                 let t0 = Instant::now();
-                if tpl.is_none() || (same_tip && !u.fill) {
+                if tpl.is_none() || (same_tip && !u.fill && !u.refresh) {
                     tpl = Some(self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await?);
                 }
                 let tpl = tpl.unwrap();
@@ -966,9 +976,22 @@ impl Pool {
         if !self.is_current(&job) {
             return; // a newer block already replaced it
         }
-        let u = Upd { new_tip: Some(job.prev_hex.clone()), fill: true, ..Default::default() };
-        if let Err(e) = self.update_template(u).await {
-            log!("WARNING", "full template after the empty one: {}", e);
+        let mut tries = 0u32;
+        loop {
+            let u = Upd { new_tip: Some(job.prev_hex.clone()), fill: true, ..Default::default() };
+            match self.update_template(u).await {
+                Ok(()) => break,
+                Err(e) => {
+                    tries += 1;
+                    if tries <= 3 || tries % 30 == 0 {
+                        log!("WARNING", "full template after the empty one (try {}): {}; trying again in 2 s", tries, e);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !self.is_current(&job) {
+                break; // a newer job (another block, or a refresh) replaced the empty one
+            }
         }
     }
 
@@ -1060,12 +1083,24 @@ impl Pool {
 
     // ------------------------------------------------------------------ found blocks
 
-    fn save_found(&self, entry: &Value) {
+    /// Append a found block's entry to blocks_found.jsonl. `sync`: wait until it is on the disk; otherwise the
+    /// returned file is synced by the caller (in the background, so the block never waits for the disk).
+    fn save_found(&self, entry: &Value, sync: bool) -> Option<std::fs::File> {
         let path = format!("{}/blocks_found.jsonl", self.cfg.data_dir);
         let r = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .and_then(|mut f| writeln!(f, "{}", entry));
-        if let Err(e) = r {
-            log!("CRITICAL", "couldn't save block {} to {}: {}", entry["hash"], path, e);
+            .and_then(|mut f| {
+                writeln!(f, "{}", entry)?;
+                if sync {
+                    f.sync_all()?;
+                }
+                Ok(f)
+            });
+        match r {
+            Ok(f) => Some(f),
+            Err(e) => {
+                log!("CRITICAL", "couldn't save block {} to {}: {}", entry["hash"], path, e);
+                None
+            }
         }
     }
 
@@ -1083,7 +1118,15 @@ impl Pool {
         let mut sending = record.clone();
         sending["result"] = json!("sending");
         sending["hex"] = json!(block_hex);
-        self.save_found(&sending); // on disk before it goes to the node
+        // written before it goes to the node (a pool restart resends it); the disk sync runs while it is sent, so
+        // a power cut can't lose it either and the block doesn't wait for the disk
+        if let Some(f) = self.save_found(&sending, false) {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = f.sync_all() {
+                    log!("CRITICAL", "couldn't sync blocks_found.jsonl to the disk: {}", e);
+                }
+            });
+        }
         self.submit_and_record(record, block_hex, false).await;
     }
 
@@ -1133,7 +1176,7 @@ impl Pool {
         record["result"] = result;
         let mut full = record.clone();
         full["hex"] = json!(block_hex);
-        self.save_found(&full);
+        self.save_found(&full, true);
         self.state.lock().unwrap()["blocks"].as_array_mut().map(|b| b.push(record));
         if let Err(e) = self.save_state() {
             log!("CRITICAL", "couldn't save the state after block {}: {}", hash, e);
@@ -1218,7 +1261,7 @@ impl Pool {
                 record["result"] = json!("stale: never answered (Core stopped while sending it)");
                 let mut full = record.clone();
                 full["hex"] = json!(hex);
-                self.save_found(&full);
+                self.save_found(&full, true);
             }
         }
     }
@@ -1414,14 +1457,72 @@ impl Pool {
         }
     }
 
+    /// The payout address's script and the chain are looked up once at start; when the node didn't answer then
+    /// (not when the address is invalid), ask again every 30 s until it does.
+    async fn retry_start_lookups(self: Arc<Self>) {
+        loop {
+            let (address, have) = {
+                let d = self.default.read().unwrap();
+                (d.0.clone(), d.1.is_some())
+            };
+            let mut pending = false;
+            if !address.is_empty() && !have {
+                match self.lookup_script(&address).await {
+                    Lookup::Script(s) => {
+                        let mut d = self.default.write().unwrap();
+                        if d.0 == address && d.1.is_none() {
+                            d.1 = Some(s);
+                            log!("INFO", "the node answered: the payout address is set");
+                        }
+                    }
+                    Lookup::NoAnswer => pending = true,
+                    Lookup::Invalid => {}
+                }
+            }
+            if self.chain.read().unwrap().is_none() {
+                match self.rpc.call_t("getblockchaininfo", json!([]), 10).await {
+                    Ok(i) => {
+                        if let Some(c) = i["chain"].as_str() {
+                            *self.chain.write().unwrap() = Some(c.to_string());
+                            log!("INFO", "the node answered: chain {}", c);
+                        }
+                    }
+                    Err(_) => pending = true,
+                }
+            }
+            if !pending {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
     async fn refresh_templates(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let due = self.current().map_or(false, |j| j.created.elapsed().as_secs_f64() >= self.refresh_s());
-            if due {
-                if let Err(e) = self.update_template(Upd::default()).await {
-                    log!("WARNING", "template refresh: {}", e);
+            if !due {
+                continue;
+            }
+            // during the empty hold the hold itself decides (no fetch); otherwise the node builds the template
+            // first and the lock is only taken to send it out
+            let holding = self.current().map_or(false, |j| j.empty);
+            let r = if holding {
+                self.update_template(Upd::default()).await
+            } else {
+                match self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await {
+                    Ok(t) => {
+                        let stale = self.current().map_or(true, |j| j.created.elapsed().as_secs_f64() < self.refresh_s());
+                        if stale {
+                            continue; // a newer job went out while the node was building this one
+                        }
+                        self.update_template(Upd { tpl: Some(t), refresh: true, ..Default::default() }).await
+                    }
+                    Err(e) => Err(e),
                 }
+            };
+            if let Err(e) = r {
+                log!("WARNING", "template refresh: {}", e);
             }
         }
     }
@@ -1598,6 +1699,7 @@ impl Pool {
         tokio::spawn(self.clone().longpoll_blocks());
         tokio::spawn(self.clone().refresh_templates());
         tokio::spawn(self.clone().resume_unsent()); // a found block Core stopped sending, if any
+        tokio::spawn(self.clone().retry_start_lookups()); // the payout address and chain, if the node didn't answer
         if !self.cfg.web_readers.is_empty() {
             tokio::spawn(self.clone().resolve_readers()); // IPs as given, names looked up every minute
         }
