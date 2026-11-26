@@ -51,8 +51,17 @@ Planned: job declaration, a proxy mode and public stats pages.
 
 ## Screenshots
 
-The pool's built-in status page (screenshot mode: payout address and miner IPs hidden). In the Umbrel app, the
-Solo45 SV2 dashboard is what opens from the home screen; new screenshots of it follow.
+The Solo45 SV2 dashboard, what opens from the Umbrel home screen (screenshot mode: payout address and miner IPs
+hidden). Home: fleet hashrate, odds, best share, power and every miner:
+
+<p align="center"><img src="docs/gallery/4-dashboard-home.png" alt="Solo45 SV2 dashboard, Home" width="90%"></p>
+
+[Details](docs/gallery/5-dashboard-details.png): live shares, best share by miner and the journey to beat it, luck,
+tuning report, Avalon controls, block switch times.
+[Settings](docs/gallery/6-dashboard-settings.png): pool settings, share difficulty per miner, the Stratum V2 key and
+pool URL, template policy, phone alerts.
+
+The pool's own built-in status page (for running without Umbrel):
 
 <p align="center"><img src="docs/gallery/1-overview.png" alt="Solo45 SV2 status page" width="78%">
 &nbsp;<img src="docs/gallery/3-phone.jpg" alt="Solo45 SV2 on a phone" width="19%"></p>
