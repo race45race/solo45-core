@@ -77,6 +77,14 @@ The pool's own built-in status page (for running without Umbrel):
 
 Keep port 3346 on your home network: don't forward it to the internet.
 
+**Optional, faster templates (IPC):** in the Bitcoin Node app, turn on **Settings → IPC Mining Interface** (Bitcoin
+Core 32+, it restarts the node). Solo45 SV2 (app 0.0.32+) then takes its block templates over Bitcoin Core's IPC mining
+interface: a new block's full work is ready in milliseconds instead of a `getblocktemplate` call, and routine
+refreshes with thousands of transactions take ~20 ms. The app sees the node's folder read-only, only for the socket.
+With the setting off nothing changes: it uses RPC as before, and it falls back to RPC by itself whenever IPC isn't
+there. When the template policy filters (that needs each transaction's fee, which IPC doesn't give), templates come
+from `getblocktemplate`.
+
 ## Run without Umbrel
 
 ```sh
@@ -84,8 +92,12 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.18
+  ghcr.io/race45race/solo45-core:v0.0.30
 ```
+
+For IPC templates, start Bitcoin Core 32+ as `bitcoin-node -ipcbind=unix` (or `bitcoin -m node -ipcbind=unix`), mount
+its data directory into the container (read-only is enough) and set `SOLO45_IPC_SOCKET` to its `node.sock` (in the
+network's subdirectory for testnet/signet/regtest). The container must run as the user that owns the socket.
 
 The status page (port 8346) only answers the machine itself and the container's gateway; reach it through a
 reverse proxy that checks a login, or an SSH tunnel.
@@ -111,6 +123,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_TEMPLATE_REFRESH_S` | 30 | new job with fresh transactions |
 | `SOLO45_STALL_GUARD_S` | 60 | stall guard (0 = off; the status page setting wins) |
 | `SOLO45_MINER_READINGS` | 1 | read temperature, fan and watts from connected miners on private addresses (0 = off) |
+| `SOLO45_IPC_SOCKET` | | Bitcoin Core's IPC socket (`node.sock`, node started with `-ipcbind=unix`): templates over IPC, `getblocktemplate` as the fallback; status in the API's `pool.ipc` |
 
 ## API
 
@@ -149,5 +162,8 @@ curl -s -X POST localhost:3386/api/worker -H 'Content-Type: application/json' -d
 ```sh
 cargo test --release && cargo build --release
 ```
+
+Building needs the Cap'n Proto compiler and its standard schemas for the IPC client, e.g. on Debian/Ubuntu
+`apt-get install capnproto libcapnp-dev`.
 
 MIT license.
