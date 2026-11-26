@@ -1,7 +1,7 @@
 # Solo45 Core: built natively on x86 and ARM by GitHub Actions (.github/workflows/image.yml).
 FROM rust:1.100-slim-trixie AS build
 # the capnp compiler builds the IPC client for Bitcoin Core's mining interface
-RUN apt-get update && apt-get install -y --no-install-recommends capnproto && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends capnproto libcapnp-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
