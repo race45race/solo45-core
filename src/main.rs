@@ -10,6 +10,7 @@
 
 mod api;
 mod devices;
+mod ipc;
 mod job;
 mod pool;
 mod policy;

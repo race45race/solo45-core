@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Cap'n Proto compiler (for the IPC client)
+        run: sudo apt-get update && sudo apt-get install -y capnproto
       - name: Build Solo45 Core
         run: cargo build --release --locked
       - name: Bitcoin Core 32.1 (checked against SHA256SUMS)

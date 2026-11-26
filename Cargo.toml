@@ -14,6 +14,10 @@ base64 = "0.22"
 anyhow = "1"
 # Stratum V2: the reference implementation's crates (Noise, framing, messages, pool-side channels)
 stratum-apps = { version = "0.9", default-features = false, features = ["network", "core", "std"] }
+# templates over Bitcoin Core's IPC mining interface (Cap'n Proto; building needs the capnp compiler)
+bitcoin_core_sv2 = "=0.7.0"
+async-channel = "1.5"
+tokio-util = "0.7"
 
 [profile.release]
 lto = true

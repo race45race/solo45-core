@@ -90,6 +90,9 @@ impl Job {
             txids.push(hex32_rev(txid)?);
             fees += t.get("fee").and_then(|f| f.as_u64()).unwrap_or(0);
         }
+        if let Some(f) = tpl.get("total_fees").and_then(|f| f.as_u64()) {
+            fees = f; // an IPC template knows the block's fees, not each transaction's
+        }
         if !txs.is_empty() {
             *cache = next; // an empty (coinbase-only) template leaves the cache for the full one that follows
         }

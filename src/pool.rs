@@ -71,6 +71,8 @@ pub struct Config {
     pub empty_first: bool,
     pub empty_hold_s: f64,
     pub template_refresh_s: f64,
+    /// Bitcoin Core's IPC socket (node.sock, with the node's -ipcbind=unix): templates over IPC; "" = getblocktemplate only
+    pub ipc_socket: String,
     pub stall_guard_s: f64,
     /// how long a found block is resent every SUBMIT_SLOW_S before the tries drop to every SUBMIT_IDLE_S
     pub submit_slower_after_s: f64,
@@ -108,6 +110,7 @@ impl Config {
             empty_first: env("SOLO45_EMPTY_FIRST", true),
             empty_hold_s: env("SOLO45_EMPTY_HOLD_S", 10.0),
             template_refresh_s: env("SOLO45_TEMPLATE_REFRESH_S", 30.0),
+            ipc_socket: env("SOLO45_IPC_SOCKET", String::new()),
             stall_guard_s: env("SOLO45_STALL_GUARD_S", 60.0), // 0 = off
             submit_slower_after_s: env("SOLO45_SUBMIT_SLOWER_AFTER_S", SUBMIT_SLOWER_AFTER_S), // tests shorten it
             data_dir: shellexpand(&env("SOLO45_DATA_DIR", ".".to_string())),
@@ -456,6 +459,11 @@ pub struct Pool {
     pub submitting: AtomicUsize,
     tpl: tokio::sync::Mutex<TplState>,
     chain: RwLock<Option<String>>,
+    /// the IPC template source, when SOLO45_IPC_SOCKET is set
+    pub ipc: std::sync::OnceLock<Arc<crate::ipc::Ipc>>,
+    /// templates used from IPC / from getblocktemplate
+    tpl_ipc: AtomicU64,
+    tpl_rpc: AtomicU64,
     pub zmq_up: AtomicBool,
     longpoll_waiting: AtomicBool,
     guard: Mutex<StallGuard>,
@@ -518,6 +526,9 @@ impl Pool {
             submitting: AtomicUsize::new(0),
             tpl: tokio::sync::Mutex::new(TplState::default()),
             chain: RwLock::new(None),
+            ipc: std::sync::OnceLock::new(),
+            tpl_ipc: AtomicU64::new(0),
+            tpl_rpc: AtomicU64::new(0),
             zmq_up: AtomicBool::new(false),
             longpoll_waiting: AtomicBool::new(false),
             started: now_f(),
@@ -782,9 +793,12 @@ impl Pool {
                 st.held_at = 0.0;
                 let t0 = Instant::now();
                 if tpl.is_none() || (same_tip && !u.fill && !u.refresh) {
-                    tpl = Some(self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await?);
+                    tpl = Some(self.fetch_template().await?);
                 }
-                let tpl = tpl.unwrap();
+                let mut tpl = tpl.unwrap();
+                if tpl.get("_ipc").is_some() && self.policy.lock().unwrap().cfg["mode"] == "filter" {
+                    tpl = self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await?;
+                }
                 let prev = prev_of(&tpl);
                 new_block = prev != tip;
                 if new_block && self.empty_first_on() {
@@ -846,7 +860,17 @@ impl Pool {
                     if new_block { "new-block" } else if filled { "full" } else { "updated" }, j.id, j.height,
                     j.value as f64 / 1e8, j.tx_data.len(), commas(bytes as u64), j.fees as f64 / 1e8, workers, ms);
                 // only counting, so it runs after the miners already have the job
-                if mode == "watch" {
+                if mode == "watch" && tpl.get("_ipc").is_some() {
+                    // an IPC template has no per-transaction fees: count from the node's getblocktemplate instead
+                    let (me, prev, m2, cfg2) = (self.clone(), j.prev_hex.clone(), mode.clone(), pcfg.clone());
+                    tokio::spawn(async move {
+                        if let Ok(t) = me.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await {
+                            if prev_of(&t) == prev {
+                                me.record_policy(policy::evaluate(&t, &cfg2, true), &m2, false);
+                            }
+                        }
+                    });
+                } else if mode == "watch" {
                     report = Some(policy::evaluate(&tpl, &pcfg, true));
                 } else if let Some(r) = report.as_mut() {
                     policy::add_watch(r, &tpl, &pcfg);
@@ -952,7 +976,7 @@ impl Pool {
                     st.held.is_none() || now_f() - st.held_at >= 2.0
                 };
                 if need {
-                    match self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await {
+                    match self.fetch_template().await {
                         Ok(tpl) if prev_of(&tpl) == job.prev_hex && self.is_current(&job) => {
                             let mut st = self.tpl.lock().await;
                             if self.is_current(&job) {
@@ -997,10 +1021,13 @@ impl Pool {
 
     /// The node's ZMQ new-block signal: the first sign of a new block, before its template exists.
     async fn on_block_signal(self: Arc<Self>, bhash: String) {
+        self.on_block_signal_from(bhash, "node's block signal").await
+    }
+
+    async fn on_block_signal_from(self: Arc<Self>, bhash: String, src: &'static str) {
         if bhash == self.tip() {
             return;
         }
-        let src = "node's block signal";
         let r = async {
             if self.empty_first_on() && self.empty_first(&bhash, src).await? {
                 return Ok(());
@@ -1497,6 +1524,38 @@ impl Pool {
         }
     }
 
+    /// A block template: from IPC when it is connected, current (built on the node's best block) and the template
+    /// policy isn't filtering (that needs each transaction's fee, which IPC doesn't give); otherwise getblocktemplate.
+    /// A new block's IPC template is usually a few ms away, so this waits up to 500 ms for one before falling back.
+    pub async fn fetch_template(&self) -> Result<Value> {
+        if let Some(ipc) = self.ipc.get() {
+            let filter = self.policy.lock().unwrap().cfg["mode"] == "filter";
+            if !filter && ipc.up.load(Ordering::Relaxed) {
+                if let Ok(best) = self.rpc.call_t("getbestblockhash", json!([]), 5).await {
+                    let best = best.as_str().unwrap_or("").to_string();
+                    let deadline = Instant::now() + Duration::from_millis(500);
+                    loop {
+                        let t = ipc.latest.lock().unwrap().clone();
+                        if let Some(t) = t.filter(|t| t.prev_hex == best) {
+                            let mut tpl = t.tpl.clone();
+                            let now = now_f() as u64;
+                            let mintime = tpl["mintime"].as_u64().unwrap_or(0);
+                            tpl["curtime"] = json!(now.max(mintime));
+                            self.tpl_ipc.fetch_add(1, Ordering::Relaxed);
+                            return Ok(tpl);
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        }
+        self.tpl_rpc.fetch_add(1, Ordering::Relaxed);
+        self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await
+    }
+
     async fn refresh_templates(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1510,7 +1569,7 @@ impl Pool {
             let r = if holding {
                 self.update_template(Upd::default()).await
             } else {
-                match self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await {
+                match self.fetch_template().await {
                     Ok(t) => {
                         let stale = self.current().map_or(true, |j| j.created.elapsed().as_secs_f64() < self.refresh_s());
                         if stale {
@@ -1691,6 +1750,25 @@ impl Pool {
         self.default.write().unwrap().1 = spk;
         *self.chain.write().unwrap() = self.rpc.call("getblockchaininfo", json!([])).await.ok()
             .and_then(|i| i["chain"].as_str().map(String::from)); // empty block first only once we know it's mainnet
+        if !self.cfg.ipc_socket.is_empty() {
+            let chain = self.chain.read().unwrap().clone().unwrap_or_else(|| "main".to_string());
+            let ipc = crate::ipc::start(self.cfg.ipc_socket.clone().into(), chain);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            *ipc.tip_tx.lock().unwrap() = Some(tx);
+            let _ = self.ipc.set(ipc.clone());
+            let me = self.clone();
+            tokio::spawn(async move {
+                while let Some(h) = rx.recv().await {
+                    tokio::spawn(me.clone().on_block_signal_from(h, "node's IPC"));
+                }
+            });
+            for _ in 0..30 {  // up to 3 s for the first IPC template, so the first job can use it
+                if ipc.latest.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         self.update_template(Upd { clean: true, ..Default::default() }).await?;
         if !self.cfg.zmq_hashblock.is_empty() {
             tokio::spawn(self.clone().zmq_loop());
@@ -1881,6 +1959,12 @@ impl Pool {
                 "share_seconds": self.cfg.share_seconds,
                 "min_diff": self.cfg.min_diff,
                 "zmq": self.zmq_up.load(Ordering::Relaxed),
+                "ipc": self.ipc.get().map(|i| {
+                    let mut s = i.status();
+                    s["used"] = json!(self.tpl_ipc.load(Ordering::Relaxed));
+                    s["rpc_used"] = json!(self.tpl_rpc.load(Ordering::Relaxed));
+                    s
+                }),
                 "stall_guard": {"seconds": stall_s, "events": stall_events},
             },
             "workers": workers,
