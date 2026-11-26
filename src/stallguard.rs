@@ -15,6 +15,7 @@ const KEEP_EVENTS: usize = 20;
 #[derive(Default)]
 pub struct StallGuard {
     behind_since: Option<f64>, // when the node was first seen behind the announced chain
+    last_blocks: u64,          // the node's height at the last check: a new block restarts the clock
     last_action: f64,
     warned_idle: bool, // already logged "behind, but no peer has the block in flight"
     pub events: Vec<Value>, // newest last, saved in state.json as "stall_events"
@@ -32,6 +33,13 @@ impl StallGuard {
             self.behind_since = None;
             self.warned_idle = false;
             return (vec![], None);
+        }
+        if blocks != self.last_blocks {
+            // the node got a block: whatever it waits for now (the next one, announced right after) waits from now,
+            // not from when the previous block stalled
+            self.last_blocks = blocks;
+            self.behind_since = None;
+            self.warned_idle = false;
         }
         let since = *self.behind_since.get_or_insert(now);
         let waited = now - since;
@@ -106,6 +114,18 @@ mod tests {
         assert!(g.check(100, 101, false, &peers, 2000.0, 60.0).0.is_empty());
         assert!(g.check(101, 101, false, &peers, 2050.0, 60.0).0.is_empty());
         assert!(g.check(101, 102, false, &peers, 2070.0, 60.0).0.is_empty()); // a new wait, not 70 s
+    }
+
+    #[test]
+    fn a_block_that_arrives_restarts_the_clock_for_the_next() {
+        let mut g = StallGuard::default();
+        let peers = [peer(5, &[102])];
+        assert!(g.check(100, 101, false, &peers, 0.0, 60.0).0.is_empty()); // block 101 stalls...
+        assert!(g.check(100, 101, false, &peers, 55.0, 60.0).0.is_empty());
+        // ...arrives at 58 s, and 102 is announced before the next check: 102 waits from now, not from 0 s
+        assert!(g.check(101, 102, false, &peers, 60.0, 60.0).0.is_empty());
+        assert!(g.check(101, 102, false, &peers, 119.0, 60.0).0.is_empty());
+        assert_eq!(g.check(101, 102, false, &peers, 120.0, 60.0).0.len(), 1);
     }
 
     #[test]
