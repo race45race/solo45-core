@@ -8,7 +8,8 @@ data ~/solo45-test/core-ipc). With ~300 transactions waiting, an SV2 test miner 
 is one) and the test checks that Core connected over IPC, built its jobs from IPC templates, that the node accepted
 every block, that the blocks carry the waiting transactions and pay the payout address; that with the template
 policy filtering Core uses getblocktemplate instead (blocks still accepted, the API says why) and goes back to IPC
-when it stops; that no template was skipped; that when the node restarts right after a new block (a template
+when it stops; that no template was skipped; that with empty-block-first a new block's empty job takes its header
+from IPC (no getblockheader call) and a block found on that empty job is accepted (coinbase only, pays the payout); that when the node restarts right after a new block (a template
 request in flight) Core notices, mines on getblocktemplate meanwhile and reconnects to IPC by itself; and that a
 Core pointed at a socket that isn't there mines through getblocktemplate as before.
 """
@@ -88,7 +89,7 @@ def fill_mempool(n=300):
     return addr
 
 
-def start_core(sock, payout):
+def start_core(sock, payout, extra=None):
     os.makedirs(DATA, exist_ok=True)
     for f in ("state.json", "state.json.bak", "pool.log", "blocks_found.jsonl", "history.json"):
         p = os.path.join(DATA, f)
@@ -99,6 +100,7 @@ def start_core(sock, payout):
                SOLO45_START_DIFF="0.00001", SOLO45_MIN_DIFF="0.00001", SOLO45_MINER_READINGS="0",
                SOLO45_IPC_SOCKET=sock, BITCOIN_RPC_URL="http://127.0.0.1:%d/" % RPC,
                BITCOIN_RPC_COOKIE=os.path.join(NODE, "regtest/.cookie"), BITCOIN_ZMQ_HASHBLOCK="tcp://127.0.0.1:%d" % ZMQ)
+    env.update(extra or {})
     core = subprocess.Popen([CORE, "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(80):
         try:
@@ -211,6 +213,34 @@ def main():
               (ipc.get("used") or 0) > used2 and int(cli("getblockcount")) == h5 + 1, ipc)
         alive = core.poll() is None
         check("Core kept running through the node restart", alive)
+    finally:
+        core.terminate()
+        core.wait(15)
+
+    # 4. empty block first (mainnet only, let in here by the test switch): a new block's empty job takes its header from
+    #    IPC, and a block found on that empty job (coinbase only) is accepted
+    core = start_core(SOCK, payout, {"SOLO45_TEST_EMPTY_ANY_CHAIN": "1", "SOLO45_EMPTY_HOLD_S": "20"})
+    try:
+        time.sleep(4)
+        tries, got = 0, False
+        while tries < 3 and not got:  # IPC usually beats the 30 ms wait; allow the odd block where it doesn't
+            tries += 1
+            n0 = log().count("(block header from IPC)")
+            cli("generatetoaddress", "1", payout)  # someone else's block
+            time.sleep(1.5)
+            got = log().count("(block header from IPC)") > n0
+        empties = [l for l in log().splitlines() if "empty (coinbase only" in l]
+        check("a new block: the empty job goes out first, its header from IPC (no node call)", got,
+              "%d tries; %s" % (tries, empties[-1:] if empties else "no empty job"))
+        h6 = int(cli("getblockcount"))
+        mine(1)  # inside the 20 s hold: the share (on regtest also a block) is on the empty job
+        time.sleep(3)
+        blk = json.loads(cli("getblock", cli("getbestblockhash"), "2"))
+        check("a block found on the empty job is accepted: coinbase only, pays the payout address",
+              int(cli("getblockcount")) == h6 + 1 and len(blk["tx"]) == 1
+              and any(o["scriptPubKey"]["hex"] == spk for o in blk["tx"][0]["vout"]), "%d txs" % len(blk["tx"]))
+        bad = [l for l in log().splitlines() if (" ERROR " in l or " CRITICAL " in l) and "BLOCK FOUND" not in l and "submitblock" not in l]
+        check("no ERROR/CRITICAL in the log with empty jobs", not bad, bad[:3])
     finally:
         core.terminate()
         core.wait(15)

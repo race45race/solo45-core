@@ -46,6 +46,19 @@ pub struct Ipc {
     skip_logged: Mutex<Option<(String, Instant)>>,
     /// the chain tip Core announced last (display hex): an extra new-block signal for the pool
     pub tip_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// the newest block Core announced, with what an empty job on top of it needs
+    pub tip: Mutex<Option<IpcTip>>,
+}
+
+/// A new block as Core announced it (SetNewPrevHash + the pre-built template it points to): everything an empty
+/// job for the next block needs, so the pool doesn't have to ask the node for the block header.
+#[derive(Clone)]
+pub struct IpcTip {
+    pub prev_hex: String,
+    pub height: u64,
+    pub bits: u32,
+    pub ntime: u32,
+    pub version: u32,
 }
 
 /// What a NewTemplate gives that the pool needs (kept until its transactions arrive).
@@ -178,7 +191,11 @@ async fn session(ipc: Arc<Ipc>, sock: PathBuf, chain: &str) -> Result<(), String
                 bits = s.n_bits;
                 ntime = s.ntime_start;
                 pending.clear();
-                if let Some(p) = futures.remove(&s.template_id) {
+                let fut = futures.remove(&s.template_id);
+                // the new block's height (from its pre-built template), bits and earliest time: an empty job's header
+                *ipc.tip.lock().unwrap() = fut.as_ref().map(|p| IpcTip {
+                    prev_hex: hex.clone(), height: p.height, bits: s.n_bits, ntime: s.ntime_start, version: p.version });
+                if let Some(p) = fut {
                     pending.insert(s.template_id, p);
                     let _ = to_core.send(TemplateDistributionOwned::RequestTransactionData(
                         RequestTransactionDataOwned { template_id: s.template_id })).await;
@@ -309,6 +326,17 @@ pub fn tx_ids(raw: &[u8]) -> Option<(String, String)> {
     Some((hex::encode(txid), hex::encode(wtxid)))
 }
 
+/// A coinbase-only template for the block Core announced in `t`, in getblocktemplate's shape. Height, bits and the
+/// earliest time are Core's own for that block, so (unlike a copy of the previous header's bits) it is right for the
+/// first block of a difficulty period too.
+pub fn empty_template(t: &IpcTip, now: f64, chain: &str) -> Value {
+    json!({
+        "height": t.height, "previousblockhash": t.prev_hex, "version": t.version, "bits": format!("{:08x}", t.bits),
+        "curtime": (now as u64).max(t.ntime as u64), "mintime": t.ntime, "coinbasevalue": subsidy(t.height, chain),
+        "transactions": []
+    })
+}
+
 /// The block subsidy at `height` on this chain (regtest halves every 150 blocks, the others every 210,000).
 pub fn subsidy(height: u64, chain: &str) -> u64 {
     let interval = if chain == "regtest" { 150 } else { 210_000 };
@@ -344,6 +372,23 @@ fn to_gbt(p: &Pending, prev_hex: &str, bits: u32, ntime: u32, txs: &[Vec<u8>], c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_template_from_cores_new_block() {
+        let t = IpcTip { prev_hex: "00ab".into(), height: 977_760, bits: 0x17023a04, ntime: 1_800_000_000, version: 0x20000000 };
+        let e = empty_template(&t, 1_700_000_000.0, "main");
+        assert_eq!(e["height"], 977_760);
+        assert_eq!(e["previousblockhash"], "00ab");
+        assert_eq!(e["bits"], "17023a04");
+        assert_eq!(e["curtime"], 1_800_000_000u64); // never before Core's earliest time
+        assert_eq!(e["coinbasevalue"], 312_500_000u64);
+        assert_eq!(e["transactions"], json!([]));
+        assert_eq!(empty_template(&t, 1_900_000_000.0, "main")["curtime"], 1_900_000_000u64);
+        // the first block of a difficulty period works too (Core's bits are already the new ones)
+        let t2 = IpcTip { height: 2016 * 485, ..t.clone() };
+        assert_eq!(empty_template(&t2, 0.0, "main")["height"], 2016 * 485);
+        assert_eq!(empty_template(&IpcTip { height: 300, ..t }, 0.0, "regtest")["coinbasevalue"], 1_250_000_000u64);
+    }
 
     #[test]
     fn skipped_templates_are_counted_with_the_last_reason() {

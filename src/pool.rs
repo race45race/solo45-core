@@ -422,7 +422,7 @@ fn prev_of(t: &Value) -> String {
 
 /// A coinbase-only template for the block on top of `hdr` (a getblockheader reply), built without asking the node
 /// for a template. None when the next block starts a new difficulty period (its bits can't be copied).
-pub fn empty_template(hdr: &Value, version: u32, now: f64) -> Option<Value> {
+pub fn empty_template(hdr: &Value, version: u32, now: f64, chain: &str) -> Option<Value> {
     let height = hdr["height"].as_u64()? + 1;
     if height % 2016 == 0 {
         return None;
@@ -431,7 +431,7 @@ pub fn empty_template(hdr: &Value, version: u32, now: f64) -> Option<Value> {
     Some(json!({
         "height": height, "previousblockhash": hdr["hash"], "version": version, "bits": hdr["bits"],
         "curtime": (now as u64).max(mintime), "mintime": mintime,
-        "coinbasevalue": 5_000_000_000u64.checked_shr((height / 210_000) as u32).unwrap_or(0),
+        "coinbasevalue": crate::ipc::subsidy(height, chain),
         "transactions": []
     }))
 }
@@ -903,15 +903,42 @@ impl Pool {
     /// None when it can't be used: not mainnet, a reorg or skipped block, or a new difficulty period.
     async fn send_empty(&self, st: &mut TplState, prev: &str, source: &str) -> Result<Option<Arc<Job>>> {
         let Some(cur) = self.current() else { return Ok(None) };
-        if self.chain.read().unwrap().as_deref() != Some("main") {
+        let chain = self.chain.read().unwrap().clone().unwrap_or_default();
+        // mainnet only (test networks make blocks every few seconds); SOLO45_TEST_EMPTY_ANY_CHAIN=1 lets the tests in
+        if chain != "main" && std::env::var("SOLO45_TEST_EMPTY_ANY_CHAIN").as_deref() != Ok("1") {
             return Ok(None);
         }
         let t0 = Instant::now();
-        let hdr = self.rpc.call_t("getblockheader", json!([prev]), 5).await?;
-        if hdr["previousblockhash"].as_str() != Some(self.tip().as_str()) {
-            return Ok(None); // not the next block on top of ours: use the node's template
+        // With IPC, Core's announcement of the block already holds the next block's height, bits and earliest time: no
+        // getblockheader call (it waits while the node is busy connecting the block). It usually lands within a few ms
+        // of the ZMQ signal, so wait up to 30 ms for it before asking the node.
+        let mut from_ipc = None;
+        if let Some(ipc) = self.ipc.get().filter(|i| i.up.load(Ordering::Relaxed)) {
+            let deadline = Instant::now() + Duration::from_millis(30);
+            loop {
+                let t = ipc.tip.lock().unwrap().clone();
+                if let Some(t) = t.filter(|t| t.prev_hex == prev) {
+                    from_ipc = Some(t);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
         }
-        let Some(tpl) = empty_template(&hdr, cur.version, now_f()) else { return Ok(None) };
+        let tpl = match &from_ipc {
+            Some(t) if t.height == cur.height + 1 => crate::ipc::empty_template(t, now_f(), &chain),
+            Some(_) => return Ok(None), // not the next block on top of ours: use the node's template
+            None => {
+                let hdr = self.rpc.call_t("getblockheader", json!([prev]), 5).await?;
+                if hdr["previousblockhash"].as_str() != Some(self.tip().as_str()) {
+                    return Ok(None); // not the next block on top of ours: use the node's template
+                }
+                let Some(tpl) = empty_template(&hdr, cur.version, now_f(), &chain) else { return Ok(None) };
+                tpl
+            }
+        };
         let mut j = {
             let mut cache = self.tx_cache.lock().unwrap();
             Job::new(&self.next_job_id(), &tpl, self.cfg.coinbase_tag.as_bytes(), &mut cache)?
@@ -926,8 +953,9 @@ impl Pool {
         let ms = t0.elapsed().as_millis() as u64;
         self.note_switch(&j, ms, workers, source);
         log!("INFO", "new network block {} ({}), now mining {} (spotted by the {})", j.height - 1, j.prev_hex, j.height, source);
-        log!("INFO", "new-block job {} for block {}: empty (coinbase only, {:.8} BTC), sent to {} workers in {} ms; \
-                      the full template follows in {} s", j.id, j.height, j.value as f64 / 1e8, workers, ms, g3(self.empty_hold_s()));
+        log!("INFO", "new-block job {} for block {}: empty (coinbase only, {:.8} BTC), sent to {} workers in {} ms{}; \
+                      the full template follows in {} s", j.id, j.height, j.value as f64 / 1e8, workers, ms,
+             if from_ipc.is_some() { " (block header from IPC)" } else { "" }, g3(self.empty_hold_s()));
         Ok(Some(j))
     }
 
@@ -2310,14 +2338,14 @@ mod tests {
     #[test]
     fn empty_template_like_pool_py() {
         let hdr = json!({"height": 976754, "hash": "00ab", "bits": "17023a04", "mediantime": 1_800_000_000u64});
-        let t = empty_template(&hdr, 0x20000000, 1_700_000_000.0).unwrap();
+        let t = empty_template(&hdr, 0x20000000, 1_700_000_000.0, "main").unwrap();
         assert_eq!(t["height"], 976755);
         assert_eq!(t["coinbasevalue"], 312_500_000u64);
         assert_eq!(t["curtime"], 1_800_000_001u64); // never before mintime
         assert_eq!(t["transactions"], json!([]));
         // the first block of a difficulty period can't copy the bits
         let hdr2 = json!({"height": 2016 * 485 - 1, "hash": "00", "bits": "17023a04", "mediantime": 1});
-        assert!(empty_template(&hdr2, 0x20000000, 0.0).is_none());
+        assert!(empty_template(&hdr2, 0x20000000, 0.0, "main").is_none());
     }
 
     #[test]
