@@ -123,7 +123,7 @@ reverse proxy that checks a login, or an SSH tunnel.
 | `SOLO45_TEMPLATE_REFRESH_S` | 30 | new job with fresh transactions |
 | `SOLO45_STALL_GUARD_S` | 60 | stall guard (0 = off; the status page setting wins) |
 | `SOLO45_MINER_READINGS` | 1 | read temperature, fan and watts from connected miners on private addresses (0 = off) |
-| `SOLO45_IPC_SOCKET` | | Bitcoin Core's IPC socket (`node.sock`, node started with `-ipcbind=unix`): templates over IPC, `getblocktemplate` as the fallback; status in the API's `pool.ipc` |
+| `SOLO45_IPC_SOCKET` | | Bitcoin Core's IPC socket (`node.sock`, node started with `-ipcbind=unix`): templates over IPC, `getblocktemplate` as the fallback; status in the API's `pool.ipc`: `up`, `age_s` (newest template), `used` / `rpc_used` (jobs from IPC / from getblocktemplate), `fallback` (why getblocktemplate was used last), `skipped` + `last_skip` (templates from the node it couldn't use, and why) |
 
 ## API
 
