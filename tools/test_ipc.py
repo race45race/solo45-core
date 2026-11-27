@@ -7,8 +7,10 @@ Its own node (datadir ~/solo45-test/core-ipc-node, RPC 18653, ZMQ 28654) and Cor
 data ~/solo45-test/core-ipc). With ~300 transactions waiting, an SV2 test miner finds blocks (on regtest every share
 is one) and the test checks that Core connected over IPC, built its jobs from IPC templates, that the node accepted
 every block, that the blocks carry the waiting transactions and pay the payout address; that with the template
-policy filtering Core uses getblocktemplate instead (blocks still accepted); and that a Core pointed at a socket that
-isn't there mines through getblocktemplate as before.
+policy filtering Core uses getblocktemplate instead (blocks still accepted, the API says why) and goes back to IPC
+when it stops; that no template was skipped; that when the node restarts right after a new block (a template
+request in flight) Core notices, mines on getblocktemplate meanwhile and reconnects to IPC by itself; and that a
+Core pointed at a socket that isn't there mines through getblocktemplate as before.
 """
 import json, os, subprocess, sys, time, urllib.request
 
@@ -115,6 +117,26 @@ def mine(shares):
                    capture_output=True, text=True)
 
 
+def ipc_state():
+    return (api().get("pool") or {}).get("ipc") or {}
+
+
+def wait_for(cond, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            s = ipc_state()
+            if cond(s):
+                return s
+        except Exception:
+            pass
+        time.sleep(0.5)
+    try:
+        return ipc_state()
+    except Exception:
+        return {}
+
+
 def log():
     return open(os.path.join(DATA, "pool.log"), errors="replace").read()
 
@@ -153,9 +175,42 @@ def main():
         ipc = (api().get("pool") or {}).get("ipc") or {}
         check("with the policy filtering, templates come from getblocktemplate", (ipc.get("rpc_used") or 0) > rpc0, ipc)
         check("and the block is accepted", int(cli("getblockcount")) == h2 + 1)
+        fb = ipc.get("fallback") or {}
+        check("the API says why: the policy filters", "policy filters" in (fb.get("reason") or ""), fb)
         post("/api/policy", {"mode": "watch"})
+        used1, h4 = ipc.get("used") or 0, int(cli("getblockcount"))
+        mine(1)
+        time.sleep(3)
+        ipc = ipc_state()
+        check("back on Watch, the next block's jobs come from IPC again",
+              (ipc.get("used") or 0) > used1 and int(cli("getblockcount")) == h4 + 1, ipc)
+        check("no template from the node was skipped", ipc.get("skipped") == 0 and ipc.get("last_skip") is None, ipc)
         bad = [l for l in log().splitlines() if (" ERROR " in l or " CRITICAL " in l) and "BLOCK FOUND" not in l and "submitblock" not in l]
         check("no ERROR/CRITICAL in the log other than found blocks", not bad, bad[:3])
+
+        # 2b. the node restarts right after a new block (Core has just asked for that template's transactions)
+        rec0 = ipc.get("reconnects") or 0
+        cli("generatetoaddress", "1", payout)
+        cli("stop")
+        down = wait_for(lambda s: s.get("up") is False, 30)
+        check("with the node gone, Core sees IPC down", down.get("up") is False, down)
+        for _ in range(120):  # wait until the node process has really exited before starting it again
+            if subprocess.run(["pgrep", "-f", "datadir=" + NODE], capture_output=True).returncode != 0:
+                break
+            time.sleep(0.5)
+        time.sleep(1)
+        start_node()
+        up = wait_for(lambda s: s.get("up") is True and (s.get("reconnects") or 0) > rec0, 60)
+        check("after the node is back Core reconnects to IPC by itself", up.get("up") is True and (up.get("reconnects") or 0) > rec0, up)
+        time.sleep(3)
+        used2, h5 = up.get("used") or 0, int(cli("getblockcount"))
+        mine(1)
+        time.sleep(3)
+        ipc = ipc_state()
+        check("and mines on IPC templates again (block accepted)",
+              (ipc.get("used") or 0) > used2 and int(cli("getblockcount")) == h5 + 1, ipc)
+        alive = core.poll() is None
+        check("Core kept running through the node restart", alive)
     finally:
         core.terminate()
         core.wait(15)

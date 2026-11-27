@@ -39,6 +39,11 @@ pub struct Ipc {
     pub templates: AtomicU64,
     pub reconnects: AtomicU64,
     pub last_error: Mutex<Option<String>>,
+    /// templates Core sent that the pool couldn't use, and why the last one was left out (and when)
+    pub skipped: AtomicU64,
+    pub last_skip: Mutex<Option<(String, Instant)>>,
+    /// the last skip that went to the log: the same reason is logged again only after 10 minutes
+    skip_logged: Mutex<Option<(String, Instant)>>,
     /// the chain tip Core announced last (display hex): an extra new-block signal for the pool
     pub tip_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
 }
@@ -59,7 +64,27 @@ impl Ipc {
             "reconnects": self.reconnects.load(Ordering::Relaxed),
             "error": self.last_error.lock().unwrap().clone(),
             "age_s": self.latest.lock().unwrap().as_ref().map(|t| t.at.elapsed().as_secs_f64()),
+            "skipped": self.skipped.load(Ordering::Relaxed),
+            "last_skip": self.last_skip.lock().unwrap().as_ref()
+                .map(|(r, at)| json!({"reason": r, "age_s": at.elapsed().as_secs_f64()})),
         })
+    }
+
+    /// A template from Core that the pool can't use: counted and kept as the last skip reason for the API. The log
+    /// gets it once per reason every 10 minutes (and at most one line every 10 s), so a change in Core that hits
+    /// every template doesn't flood it. The pool keeps mining on the last good template or getblocktemplate.
+    pub fn skip(&self, template_id: u64, reason: &str) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+        *self.last_skip.lock().unwrap() = Some((reason.to_string(), Instant::now()));
+        let mut logged = self.skip_logged.lock().unwrap();
+        let quiet = logged.as_ref().map_or(false, |(r, at)| {
+            at.elapsed() < Duration::from_secs(10) || (r == reason && at.elapsed() < Duration::from_secs(600))
+        });
+        if !quiet {
+            crate::log!("WARNING", "IPC: template {} skipped: {} ({} skipped so far)", template_id, reason,
+                        self.skipped.load(Ordering::Relaxed));
+            *logged = Some((reason.to_string(), Instant::now()));
+        }
     }
 }
 
@@ -133,7 +158,7 @@ async fn session(ipc: Arc<Ipc>, sock: PathBuf, chain: &str) -> Result<(), String
                 let p = match pending_from(&t) {
                     Ok(p) => p,
                     Err(e) => {
-                        crate::log!("WARNING", "IPC: template {} not usable: {}", t.template_id, e);
+                        ipc.skip(t.template_id, &e);
                         continue;
                     }
                 };
@@ -168,7 +193,7 @@ async fn session(ipc: Arc<Ipc>, sock: PathBuf, chain: &str) -> Result<(), String
                 let Some(prev_hex) = prev.clone() else { continue };
                 if !d.excess_data.as_ref().iter().all(|b| *b == 0) {
                     // the coinbase witness the commitment was made for isn't the all-zero one the pool uses
-                    crate::log!("WARNING", "IPC: template {} uses a non-zero coinbase witness: skipped", d.template_id);
+                    ipc.skip(d.template_id, "its witness commitment is for a non-zero coinbase witness");
                     continue;
                 }
                 let txs: Vec<Vec<u8>> = d.transaction_list.into_inner().into_iter().map(|t| t.as_ref().to_vec()).collect();
@@ -178,11 +203,15 @@ async fn session(ipc: Arc<Ipc>, sock: PathBuf, chain: &str) -> Result<(), String
                         ipc.templates.fetch_add(1, Ordering::Relaxed);
                         ipc.ready.notify_waiters();
                     }
-                    Err(e) => crate::log!("WARNING", "IPC: template {} not usable: {}", d.template_id, e),
+                    Err(e) => ipc.skip(d.template_id, &e),
                 }
             }
             TemplateDistributionOwned::RequestTransactionDataError(e) => {
-                pending.remove(&e.template_id);
+                // only a template still wanted counts: a new block clears the requests it made stale
+                if pending.remove(&e.template_id).is_some() {
+                    let code = String::from_utf8_lossy(e.error_code.as_ref()).to_string();
+                    ipc.skip(e.template_id, &format!("the node sent no transactions for it ({})", code));
+                }
             }
             _ => {}
         }
@@ -315,6 +344,19 @@ fn to_gbt(p: &Pending, prev_hex: &str, bits: u32, ntime: u32, txs: &[Vec<u8>], c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_templates_are_counted_with_the_last_reason() {
+        let ipc = Ipc::default();
+        assert_eq!(ipc.status()["skipped"], 0);
+        assert!(ipc.status()["last_skip"].is_null());
+        ipc.skip(1, "no block height in the coinbase prefix");
+        ipc.skip(2, "the node sent no transactions for it (template-id-not-found)");
+        let s = ipc.status();
+        assert_eq!(s["skipped"], 2);
+        assert_eq!(s["last_skip"]["reason"], "the node sent no transactions for it (template-id-not-found)");
+        assert!(s["last_skip"]["age_s"].as_f64().unwrap() < 5.0);
+    }
 
     #[test]
     fn heights_from_the_coinbase_prefix() {

@@ -464,6 +464,8 @@ pub struct Pool {
     /// templates used from IPC / from getblocktemplate
     tpl_ipc: AtomicU64,
     tpl_rpc: AtomicU64,
+    /// why the last template came from getblocktemplate although IPC is set up, and when (for the API)
+    tpl_fallback: Mutex<Option<(&'static str, Instant)>>,
     pub zmq_up: AtomicBool,
     longpoll_waiting: AtomicBool,
     guard: Mutex<StallGuard>,
@@ -529,6 +531,7 @@ impl Pool {
             ipc: std::sync::OnceLock::new(),
             tpl_ipc: AtomicU64::new(0),
             tpl_rpc: AtomicU64::new(0),
+            tpl_fallback: Mutex::new(None),
             zmq_up: AtomicBool::new(false),
             longpoll_waiting: AtomicBool::new(false),
             started: now_f(),
@@ -1530,8 +1533,11 @@ impl Pool {
     pub async fn fetch_template(&self) -> Result<Value> {
         if let Some(ipc) = self.ipc.get() {
             let filter = self.policy.lock().unwrap().cfg["mode"] == "filter";
+            let mut why = if filter { "the template policy filters (that needs each transaction's fee)" } else { "IPC isn't connected" };
             if !filter && ipc.up.load(Ordering::Relaxed) {
+                why = "the node didn't answer getbestblockhash";
                 if let Ok(best) = self.rpc.call_t("getbestblockhash", json!([]), 5).await {
+                    why = "no IPC template for the node's best block within 500 ms";
                     let best = best.as_str().unwrap_or("").to_string();
                     let deadline = Instant::now() + Duration::from_millis(500);
                     loop {
@@ -1551,6 +1557,7 @@ impl Pool {
                     }
                 }
             }
+            *self.tpl_fallback.lock().unwrap() = Some((why, Instant::now()));
         }
         self.tpl_rpc.fetch_add(1, Ordering::Relaxed);
         self.rpc.call("getblocktemplate", json!([{"rules": ["segwit"]}])).await
@@ -1963,6 +1970,8 @@ impl Pool {
                     let mut s = i.status();
                     s["used"] = json!(self.tpl_ipc.load(Ordering::Relaxed));
                     s["rpc_used"] = json!(self.tpl_rpc.load(Ordering::Relaxed));
+                    s["fallback"] = json!(self.tpl_fallback.lock().unwrap().as_ref()
+                        .map(|(r, at)| json!({"reason": r, "age_s": at.elapsed().as_secs_f64()})));
                     s
                 }),
                 "stall_guard": {"seconds": stall_s, "events": stall_events},
