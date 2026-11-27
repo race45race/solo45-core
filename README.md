@@ -92,7 +92,7 @@ docker run -d --name solo45-core -p 3346:3346 -v $PWD/data:/data \
   -e SOLO45_DATA_DIR=/data -e SOLO45_WEB_PORT=8346 \
   -e BITCOIN_RPC_URL=http://<node>:8332/ -e BITCOIN_RPC_USER=<user> -e BITCOIN_RPC_PASS=<pass> \
   -e BITCOIN_ZMQ_HASHBLOCK=tcp://<node>:28332 \
-  ghcr.io/race45race/solo45-core:v0.0.30
+  ghcr.io/race45race/solo45-core:v0.0.31
 ```
 
 For IPC templates, start Bitcoin Core 32+ as `bitcoin-node -ipcbind=unix` (or `bitcoin -m node -ipcbind=unix`), mount
